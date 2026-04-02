@@ -1,0 +1,71 @@
+============================================================
+OPTIMIZATION REPORT
+============================================================
+
+Optimization Metric: total_pnl
+Total Combinations Tested: 3131
+
+----------------------------------------
+BEST PARAMETERS
+----------------------------------------
+  ma_type                   : SMA
+  ma_period                 : 100
+  rsi_period                : 7
+  rsi_oversold              : 25
+  rsi_overbought            : 70
+  stop_loss_percent         : 3.0
+  take_profit_percent       : 2.0
+  use_vwap                  : False
+  leverage                  : 5
+  position_size_percent     : 5.0
+
+----------------------------------------
+PERFORMANCE METRICS
+----------------------------------------
+  Total Trades            : 17
+  Win Rate                : 82.4%
+  Total PnL               : $519.45 (+5.2%)
+  Average Trade           : $30.56
+  Average Win             : $48.34
+  Average Loss            : $-52.45
+  Profit Factor           : 4.30
+  Max Drawdown            : $157.82 (1.6%)
+  Sharpe Ratio            : 0.63
+
+----------------------------------------
+TRADE BREAKDOWN
+----------------------------------------
+  Stop Loss Exits         : 2 (11.8%)
+  Take Profit Exits       : 14 (82.4%)
+  Other Exits             : 1
+
+----------------------------------------
+TOP 5 PARAMETER SETS
+----------------------------------------
+
+  #1: total_pnl=519.45
+      MA: SMA100, RSI: 7 (25/70)
+      SL: 3.0%, TP: 2.0%, VWAP: False
+      Trades: 17, Win Rate: 82.4%, PF: 4.30
+
+  #2: total_pnl=517.41
+      MA: SMA50, RSI: 7 (35/65)
+      SL: 3.0%, TP: 5.0%, VWAP: False
+      Trades: 10, Win Rate: 70.0%, PF: 3.17
+
+  #3: total_pnl=517.41
+      MA: EMA50, RSI: 7 (35/65)
+      SL: 3.0%, TP: 5.0%, VWAP: False
+      Trades: 10, Win Rate: 70.0%, PF: 3.17
+
+  #4: total_pnl=506.98
+      MA: SMA50, RSI: 7 (25/70)
+      SL: 3.0%, TP: 3.0%, VWAP: False
+      Trades: 11, Win Rate: 81.8%, PF: 4.25
+
+  #5: total_pnl=499.65
+      MA: SMA100, RSI: 7 (25/70)
+      SL: 3.0%, TP: 3.0%, VWAP: False
+      Trades: 14, Win Rate: 71.4%, PF: 3.06
+
+============================================================
