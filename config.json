@@ -1,0 +1,28 @@
+{
+  "trading": {
+    "symbols": ["BTC", "ETH"],
+    "leverage": 5,
+    "margin_type": "isolated",
+    "position_size_percent": 5.0
+  },
+  "strategy": {
+    "daily_ma_type": "SMA",
+    "daily_ma_period": 50,
+    "intraday_timeframe": "15m",
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "vwap_enabled": true
+  },
+  "risk_management": {
+    "stop_loss_percent": 2.0,
+    "take_profit_percent": 4.0,
+    "use_atr_for_sl": false,
+    "atr_period": 14,
+    "atr_multiplier": 1.5
+  },
+  "bot": {
+    "loop_interval_seconds": 60,
+    "log_level": "INFO"
+  }
+}
