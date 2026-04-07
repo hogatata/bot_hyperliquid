@@ -1,4 +1,10 @@
-"""Backtesting engine for simulating trading strategies on historical data."""
+"""Backtesting engine for simulating trading strategies on historical data.
+
+Supports advanced features:
+- Trailing Stop Loss: SL trails price by ATR multiplier when in profit
+- Volatility Filter: Skips entries when ATR is below threshold
+- Macro Filters simulation for regime detection
+"""
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,9 +38,13 @@ class Trade:
     size: float
     stop_loss: float
     take_profit: float
+    atr_at_entry: float = 0.0  # ATR value at entry (for trailing)
+    highest_price: float = 0.0  # Track highest price (for LONG trailing)
+    lowest_price: float = 0.0   # Track lowest price (for SHORT trailing)
     pnl: float = 0.0
     pnl_percent: float = 0.0
-    exit_reason: str = ""  # "stop_loss", "take_profit", "signal", "end_of_data"
+    exit_reason: str = ""  # "stop_loss", "take_profit", "trailing_stop", "signal", "end_of_data"
+    was_filtered: bool = False  # Track if trade was skipped by filter
 
 
 @dataclass
@@ -61,6 +71,10 @@ class BacktestResult:
     
     profit_factor: float = 0.0  # gross profit / gross loss
     sharpe_ratio: float = 0.0
+    
+    # Advanced metrics
+    trailing_stop_exits: int = 0
+    filtered_signals: int = 0  # Signals blocked by volatility filter
     
     # Trade list
     trades: list = field(default_factory=list)
@@ -103,6 +117,16 @@ class Backtester:
         stop_loss_percent: float = 2.0,
         take_profit_percent: float = 4.0,
         use_vwap: bool = True,
+        # New advanced parameters
+        trailing_stop_enabled: bool = False,
+        trailing_atr_multiplier: float = 1.5,
+        volatility_filter_enabled: bool = False,
+        volatility_atr_period: int = 14,
+        volatility_lookback: int = 20,
+        volatility_threshold: float = 0.5,
+        use_atr_for_sl: bool = False,
+        atr_sl_multiplier: float = 1.5,
+        atr_tp_multiplier: float = 3.0,
     ) -> BacktestResult:
         """Run backtest with given parameters.
         
@@ -116,6 +140,15 @@ class Backtester:
             stop_loss_percent: Stop loss as percentage.
             take_profit_percent: Take profit as percentage.
             use_vwap: Whether to use VWAP in signals.
+            trailing_stop_enabled: Enable trailing stop loss.
+            trailing_atr_multiplier: ATR multiplier for trailing distance.
+            volatility_filter_enabled: Enable volatility filter.
+            volatility_atr_period: ATR period for volatility calculation.
+            volatility_lookback: Periods to calculate average ATR.
+            volatility_threshold: Ratio threshold (current ATR / avg ATR).
+            use_atr_for_sl: Use ATR-based SL instead of percentage.
+            atr_sl_multiplier: ATR multiplier for stop loss.
+            atr_tp_multiplier: ATR multiplier for take profit.
             
         Returns:
             BacktestResult with all metrics and trades.
@@ -132,6 +165,14 @@ class Backtester:
             "use_vwap": use_vwap,
             "leverage": self.leverage,
             "position_size_percent": self.position_size_percent,
+            # Advanced params
+            "trailing_stop_enabled": trailing_stop_enabled,
+            "trailing_atr_multiplier": trailing_atr_multiplier,
+            "volatility_filter_enabled": volatility_filter_enabled,
+            "volatility_threshold": volatility_threshold,
+            "use_atr_for_sl": use_atr_for_sl,
+            "atr_sl_multiplier": atr_sl_multiplier,
+            "atr_tp_multiplier": atr_tp_multiplier,
         }
         
         # Add indicators
@@ -149,11 +190,16 @@ class Backtester:
         if use_vwap:
             df = add_vwap(df)
         
+        # Add ATR for trailing stop and volatility filter
+        atr_column = f"atr_{volatility_atr_period}"
+        df = add_atr(df, period=volatility_atr_period, column_name=atr_column)
+        
         # Initialize state
         capital = self.initial_capital
         equity_curve = [capital]
         trades = []
         current_position: Optional[Trade] = None
+        filtered_signals = 0  # Track filtered entries
         
         # Skip initial rows where indicators are NaN
         start_idx = max(ma_period, rsi_period) + 1
@@ -165,16 +211,41 @@ class Backtester:
             
             current_price = row["close"]
             current_time = row["timestamp"] if "timestamp" in df.columns else i
+            current_atr = row[atr_column] if not pd.isna(row[atr_column]) else 0
             
             # Check if we have a position
             if current_position is not None:
+                # Update trailing stop if enabled
+                if trailing_stop_enabled and current_position.atr_at_entry > 0:
+                    trail_distance = current_position.atr_at_entry * trailing_atr_multiplier
+                    
+                    if current_position.side == Side.LONG:
+                        # Track highest price
+                        if row["high"] > current_position.highest_price:
+                            current_position.highest_price = row["high"]
+                            # Calculate new trailing SL
+                            new_sl = current_position.highest_price - trail_distance
+                            # Only move SL up (never down)
+                            if new_sl > current_position.stop_loss:
+                                current_position.stop_loss = new_sl
+                    else:  # SHORT
+                        # Track lowest price
+                        if row["low"] < current_position.lowest_price:
+                            current_position.lowest_price = row["low"]
+                            # Calculate new trailing SL
+                            new_sl = current_position.lowest_price + trail_distance
+                            # Only move SL down (never up)
+                            if new_sl < current_position.stop_loss:
+                                current_position.stop_loss = new_sl
+                
                 # Check for stop loss or take profit
                 if current_position.side == Side.LONG:
                     # Check SL (price went below)
                     if row["low"] <= current_position.stop_loss:
                         exit_price = current_position.stop_loss
+                        exit_reason = "trailing_stop" if trailing_stop_enabled else "stop_loss"
                         current_position = self._close_position(
-                            current_position, exit_price, current_time, "stop_loss"
+                            current_position, exit_price, current_time, exit_reason
                         )
                         capital += current_position.pnl
                         trades.append(current_position)
@@ -192,8 +263,9 @@ class Backtester:
                     # Check SL (price went above)
                     if row["high"] >= current_position.stop_loss:
                         exit_price = current_position.stop_loss
+                        exit_reason = "trailing_stop" if trailing_stop_enabled else "stop_loss"
                         current_position = self._close_position(
-                            current_position, exit_price, current_time, "stop_loss"
+                            current_position, exit_price, current_time, exit_reason
                         )
                         capital += current_position.pnl
                         trades.append(current_position)
@@ -218,19 +290,36 @@ class Backtester:
                 )
                 
                 if signal is not None:
+                    # Apply volatility filter if enabled
+                    if volatility_filter_enabled:
+                        avg_atr = df[atr_column].iloc[max(0, i-volatility_lookback):i].mean()
+                        if avg_atr > 0 and current_atr < (avg_atr * volatility_threshold):
+                            # Skip entry - market too choppy
+                            filtered_signals += 1
+                            signal = None
+                
+                if signal is not None:
                     # Calculate position size
                     position_value = (capital * self.position_size_percent / 100) * self.leverage
                     size = position_value / current_price
                     
-                    # Calculate SL/TP
-                    if signal == Side.LONG:
-                        sl = current_price * (1 - stop_loss_percent / 100)
-                        tp = current_price * (1 + take_profit_percent / 100)
+                    # Calculate SL/TP (ATR-based or percentage-based)
+                    if use_atr_for_sl and current_atr > 0:
+                        if signal == Side.LONG:
+                            sl = current_price - (current_atr * atr_sl_multiplier)
+                            tp = current_price + (current_atr * atr_tp_multiplier)
+                        else:
+                            sl = current_price + (current_atr * atr_sl_multiplier)
+                            tp = current_price - (current_atr * atr_tp_multiplier)
                     else:
-                        sl = current_price * (1 + stop_loss_percent / 100)
-                        tp = current_price * (1 - take_profit_percent / 100)
+                        if signal == Side.LONG:
+                            sl = current_price * (1 - stop_loss_percent / 100)
+                            tp = current_price * (1 + take_profit_percent / 100)
+                        else:
+                            sl = current_price * (1 + stop_loss_percent / 100)
+                            tp = current_price * (1 - take_profit_percent / 100)
                     
-                    # Open position
+                    # Open position with ATR tracking for trailing
                     current_position = Trade(
                         entry_time=current_time,
                         exit_time=None,
@@ -240,6 +329,9 @@ class Backtester:
                         size=size,
                         stop_loss=sl,
                         take_profit=tp,
+                        atr_at_entry=current_atr,
+                        highest_price=current_price,
+                        lowest_price=current_price,
                     )
             
             # Update equity curve
@@ -265,7 +357,7 @@ class Backtester:
             equity_curve[-1] = capital
         
         # Calculate metrics
-        return self._calculate_metrics(params, trades, equity_curve)
+        return self._calculate_metrics(params, trades, equity_curve, filtered_signals)
     
     def _check_signal(
         self,
@@ -361,10 +453,12 @@ class Backtester:
         params: dict,
         trades: list[Trade],
         equity_curve: list[float],
+        filtered_signals: int = 0,
     ) -> BacktestResult:
         """Calculate all backtest metrics."""
         
         result = BacktestResult(params=params, trades=trades, equity_curve=equity_curve)
+        result.filtered_signals = filtered_signals
         
         if not trades:
             return result
@@ -374,6 +468,9 @@ class Backtester:
         result.winning_trades = sum(1 for t in trades if t.pnl > 0)
         result.losing_trades = sum(1 for t in trades if t.pnl < 0)
         result.win_rate = result.winning_trades / result.total_trades * 100
+        
+        # Count trailing stop exits
+        result.trailing_stop_exits = sum(1 for t in trades if t.exit_reason == "trailing_stop")
         
         # PnL metrics
         pnls = [t.pnl for t in trades]

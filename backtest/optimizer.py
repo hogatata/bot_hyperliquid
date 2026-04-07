@@ -1,9 +1,10 @@
 """Parameter optimizer using grid search to find best strategy parameters."""
 
+import json
 from dataclasses import dataclass, field
 from itertools import product
+from pathlib import Path
 from typing import Optional
-import json
 
 import pandas as pd
 import numpy as np
@@ -20,8 +21,42 @@ class OptimizationResult:
     all_results: list[BacktestResult] = field(default_factory=list)
     optimization_metric: str = "total_pnl"
     
+    def to_config_updates(self) -> dict:
+        """Convert best parameters to config updates (only optimizable fields).
+        
+        Returns a dict with only the sections that should be updated,
+        preserving the structure expected by merge_with_existing_config.
+        """
+        p = self.best_params
+        return {
+            "trading": {
+                "leverage": p.get("leverage", 5),
+                "position_size_percent": p.get("position_size_percent", 5.0),
+            },
+            "strategy": {
+                "daily_ma_type": p.get("ma_type", "SMA"),
+                "daily_ma_period": p.get("ma_period", 50),
+                "rsi_period": p.get("rsi_period", 14),
+                "rsi_oversold": p.get("rsi_oversold", 30),
+                "rsi_overbought": p.get("rsi_overbought", 70),
+                "vwap_enabled": p.get("use_vwap", True),
+            },
+            "risk_management": {
+                "stop_loss_percent": p.get("stop_loss_percent", 2.0),
+                "take_profit_percent": p.get("take_profit_percent", 4.0),
+                "use_atr_for_sl": p.get("use_atr_for_sl", False),
+                "atr_multiplier": p.get("atr_sl_multiplier", 1.5),
+                "trailing_stop_enabled": p.get("trailing_stop_enabled", False),
+                "trailing_atr_multiplier": p.get("trailing_atr_multiplier", 1.5),
+            },
+            "filters": {
+                "volatility_filter_enabled": p.get("volatility_filter_enabled", False),
+                "volatility_threshold": p.get("volatility_threshold", 0.5),
+            },
+        }
+    
     def to_config_json(self) -> dict:
-        """Convert best parameters to config.json format."""
+        """Convert best parameters to config.json format (legacy - full config)."""
         p = self.best_params
         return {
             "trading": {
@@ -42,9 +77,21 @@ class OptimizationResult:
             "risk_management": {
                 "stop_loss_percent": p.get("stop_loss_percent", 2.0),
                 "take_profit_percent": p.get("take_profit_percent", 4.0),
-                "use_atr_for_sl": False,
+                "use_atr_for_sl": p.get("use_atr_for_sl", False),
                 "atr_period": 14,
-                "atr_multiplier": 1.5
+                "atr_multiplier": p.get("atr_sl_multiplier", 1.5),
+                "use_limit_orders": False,
+                "limit_order_timeout": 60,
+                "trailing_stop_enabled": p.get("trailing_stop_enabled", False),
+                "trailing_atr_multiplier": p.get("trailing_atr_multiplier", 1.5)
+            },
+            "filters": {
+                "funding_filter_enabled": False,
+                "funding_threshold": 0.01,
+                "volatility_filter_enabled": p.get("volatility_filter_enabled", False),
+                "volatility_atr_period": 14,
+                "volatility_lookback": 20,
+                "volatility_threshold": p.get("volatility_threshold", 0.5)
             },
             "bot": {
                 "loop_interval_seconds": 60,
@@ -52,18 +99,72 @@ class OptimizationResult:
             }
         }
     
-    def save_config(self, filepath: str = "config_optimized.json"):
-        """Save best parameters to a config file."""
-        config = self.to_config_json()
+    def merge_with_existing_config(self, existing_config_path: str = "config.json") -> dict:
+        """Load existing config.json and merge with optimized parameters.
+        
+        This preserves all existing settings (notifications, bot, symbols, etc.)
+        and only updates the optimizable strategy/risk parameters.
+        
+        Args:
+            existing_config_path: Path to existing config.json file.
+            
+        Returns:
+            Merged configuration dict.
+        """
+        config_path = Path(existing_config_path)
+        
+        # Load existing config or use empty dict if not found
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                existing_config = json.load(f)
+        else:
+            existing_config = {}
+        
+        # Get the optimized updates
+        updates = self.to_config_updates()
+        
+        # Deep merge: update only specific fields within each section
+        for section, section_updates in updates.items():
+            if section not in existing_config:
+                existing_config[section] = {}
+            
+            # Update individual fields within the section
+            for key, value in section_updates.items():
+                existing_config[section][key] = value
+        
+        return existing_config
+    
+    def save_config(
+        self, 
+        filepath: str = "config_optimized.json",
+        merge_existing: bool = False,
+        existing_config_path: str = "config.json",
+    ) -> str:
+        """Save best parameters to a config file.
+        
+        Args:
+            filepath: Output path for the config file.
+            merge_existing: If True, load existing config and merge updates.
+            existing_config_path: Path to existing config for merging.
+            
+        Returns:
+            Path to saved config file.
+        """
+        if merge_existing:
+            config = self.merge_with_existing_config(existing_config_path)
+        else:
+            config = self.to_config_json()
+        
         with open(filepath, "w") as f:
             json.dump(config, f, indent=2)
+        
         return filepath
 
 
 class ParameterOptimizer:
     """Grid search optimizer for strategy parameters."""
     
-    # Default parameter grids
+    # Default parameter grids (including advanced features)
     DEFAULT_GRIDS = {
         "ma_type": ["SMA", "EMA"],
         "ma_period": [20, 50, 100],
@@ -73,6 +174,27 @@ class ParameterOptimizer:
         "stop_loss_percent": [1.0, 1.5, 2.0, 2.5, 3.0],
         "take_profit_percent": [2.0, 3.0, 4.0, 5.0, 6.0],
         "use_vwap": [True, False],
+    }
+    
+    # Extended grids including trailing stop and volatility filter
+    ADVANCED_GRIDS = {
+        "ma_type": ["SMA", "EMA"],
+        "ma_period": [20, 50, 100],
+        "rsi_period": [14],
+        "rsi_oversold": [30],
+        "rsi_overbought": [70],
+        "stop_loss_percent": [1.5, 2.0, 2.5],
+        "take_profit_percent": [3.0, 4.0, 5.0],
+        "use_vwap": [True, False],
+        # Trailing stop params
+        "trailing_stop_enabled": [True, False],
+        "trailing_atr_multiplier": [1.0, 1.5, 2.0],
+        # Volatility filter params
+        "volatility_filter_enabled": [True, False],
+        "volatility_threshold": [0.3, 0.5, 0.7],
+        # ATR-based SL params
+        "use_atr_for_sl": [True, False],
+        "atr_sl_multiplier": [1.0, 1.5, 2.0],
     }
     
     def __init__(
@@ -192,6 +314,30 @@ class ParameterOptimizer:
         }
         
         return self.optimize(df, quick_grids, metric, show_progress=show_progress)
+    
+    def optimize_advanced(
+        self,
+        df: pd.DataFrame,
+        metric: str = "total_pnl",
+        min_trades: int = 5,
+        show_progress: bool = True,
+    ) -> OptimizationResult:
+        """Run optimization including advanced features (trailing stop, volatility filter).
+        
+        This tests a larger parameter space including:
+        - Trailing stop with different ATR multipliers
+        - Volatility filter with different thresholds
+        - ATR-based stop loss
+        
+        Warning: This can be slow due to the large search space.
+        """
+        return self.optimize(
+            df, 
+            self.ADVANCED_GRIDS, 
+            metric, 
+            min_trades=min_trades,
+            show_progress=show_progress
+        )
 
 
 def print_optimization_report(result: OptimizationResult):
@@ -233,11 +379,16 @@ def print_optimization_report(result: OptimizationResult):
     
     sl_exits = sum(1 for t in r.trades if t.exit_reason == "stop_loss")
     tp_exits = sum(1 for t in r.trades if t.exit_reason == "take_profit")
-    other_exits = r.total_trades - sl_exits - tp_exits
+    trailing_exits = sum(1 for t in r.trades if t.exit_reason == "trailing_stop")
+    other_exits = r.total_trades - sl_exits - tp_exits - trailing_exits
     
     print(f"  Stop Loss Exits         : {sl_exits} ({sl_exits/r.total_trades*100:.1f}%)")
     print(f"  Take Profit Exits       : {tp_exits} ({tp_exits/r.total_trades*100:.1f}%)")
+    print(f"  Trailing Stop Exits     : {trailing_exits} ({trailing_exits/r.total_trades*100:.1f}%)")
     print(f"  Other Exits             : {other_exits}")
+    
+    if hasattr(r, 'filtered_signals') and r.filtered_signals > 0:
+        print(f"  Filtered Signals        : {r.filtered_signals} (volatility filter)")
     
     # Top 5 results
     print("\n" + "-" * 40)

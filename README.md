@@ -10,6 +10,15 @@ A Python-based algorithmic trading bot for the [Hyperliquid](https://hyperliquid
 - **Kill Switch**: Emergency shutdown via Ctrl+C (cancels all orders, closes positions)
 - **Live Dashboard**: Real-time terminal display of market data and positions
 
+### Advanced Features
+
+- **Limit Orders for Entry**: Earn maker rebates by placing limit orders at best bid/ask
+- **Trailing Stop Loss**: SL dynamically trails price using ATR multiplier
+- **Macro Filters**: Block trades based on funding rate or low volatility conditions
+- **ATR-Based Risk**: Dynamic SL/TP calculated from market volatility
+- **State Recovery**: Automatically recovers position tracking after bot restarts
+- **Telegram Alerts**: Real-time notifications for trades and bot status
+
 ## 🎯 Strategy
 
 The bot follows a trend-continuation strategy:
@@ -56,6 +65,10 @@ nano .env
 HYPERLIQUID_PRIVATE_KEY=your_private_key_here
 HYPERLIQUID_WALLET_ADDRESS=0xYourWalletAddressHere
 HYPERLIQUID_TESTNET=true
+
+# Optional: Telegram notifications
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
 2. **Adjust trading parameters** in `config.json`:
@@ -78,9 +91,37 @@ HYPERLIQUID_TESTNET=true
   "risk_management": {
     "stop_loss_percent": 2.0,
     "take_profit_percent": 4.0
+  },
+  "notifications": {
+    "enable_telegram_alerts": false
   }
 }
 ```
+
+### Telegram Notifications (Optional)
+
+To receive trade alerts on your phone:
+
+1. **Create a Telegram Bot**:
+   - Message [@BotFather](https://t.me/BotFather) on Telegram
+   - Send `/newbot` and follow the prompts
+   - Copy the bot token
+
+2. **Get your Chat ID**:
+   - Start a chat with your new bot
+   - Visit: `https://api.telegram.org/bot<YourBotToken>/getUpdates`
+   - Look for `"chat":{"id":XXXXXXXX}` - that's your chat ID
+
+3. **Configure**:
+   - Add credentials to `.env`
+   - Set `"enable_telegram_alerts": true` in `config.json`
+
+**Notification types:**
+- 🤖 Bot startup/shutdown
+- 🟢/🔴 Trade opened (LONG/SHORT)
+- 💰 Trade closed with PnL
+- 📈 Trailing stop updates
+- ⚠️ Error alerts
 
 ### Running the Bot
 
@@ -176,7 +217,28 @@ uv run python tests/test_risk_manager.py
 
 # Test signal generation (no API required)
 uv run python tests/test_signals.py
+
+# Test advanced features: limit orders, trailing stop, macro filters
+uv run python tests/test_advanced_features.py
 ```
+
+## 🔬 Advanced Parameter Optimization
+
+The backtester now supports advanced features. To optimize with trailing stop and volatility filter:
+
+```python
+from backtest.optimizer import ParameterOptimizer, print_optimization_report
+
+optimizer = ParameterOptimizer()
+result = optimizer.optimize_advanced(df, metric="total_pnl")
+print_optimization_report(result)
+```
+
+This tests additional parameters:
+- `trailing_stop_enabled` (True/False)
+- `trailing_atr_multiplier` (1.0, 1.5, 2.0)
+- `volatility_filter_enabled` (True/False)
+- `volatility_threshold` (0.3, 0.5, 0.7)
 
 ## ⚙️ Configuration Options
 
@@ -208,6 +270,24 @@ uv run python tests/test_signals.py
 | `take_profit_percent` | Fixed TP % from entry | `4.0` |
 | `use_atr_for_sl` | Use ATR for dynamic SL | `false` |
 | `atr_multiplier` | ATR multiplier for SL | `1.5` |
+
+### Advanced Execution (NEW)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `use_limit_orders` | Use limit orders for entry (earn rebates) | `false` |
+| `limit_order_timeout` | Seconds to wait for limit fill | `60` |
+| `trailing_stop_enabled` | Enable trailing stop loss | `false` |
+| `trailing_atr_multiplier` | ATR multiplier for trailing distance | `1.5` |
+
+### Macro Filters (NEW)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `funding_filter_enabled` | Block trades when funding is extreme | `false` |
+| `funding_threshold` | Funding rate threshold (%) | `0.01` |
+| `volatility_filter_enabled` | Block trades in low volatility | `false` |
+| `volatility_threshold` | ATR ratio threshold | `0.5` |
 
 ## 🔧 Extending the Bot
 

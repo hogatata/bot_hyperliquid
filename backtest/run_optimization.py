@@ -8,19 +8,37 @@ This script:
 1. Fetches last 30 days of candle data from Hyperliquid
 2. Runs grid search optimization on strategy parameters
 3. Prints a detailed report
-4. Saves the best configuration to config_optimized.json
+4. Directly overwrites config.json with optimized settings
+5. Sends Telegram notification with results
+
+Can be run as a daily cron job for autonomous parameter adaptation.
 """
 
+import os
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.exchange.client import HyperliquidClient
+from dotenv import load_dotenv
+
 from backtest.backtester import Backtester
 from backtest.optimizer import ParameterOptimizer, print_optimization_report
+from src.utils.notifier import TelegramNotifier
+
+
+def load_telegram_credentials() -> tuple[str, str]:
+    """Load Telegram credentials from .env file."""
+    env_path = PROJECT_ROOT / ".env"
+    load_dotenv(env_path)
+    
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    
+    return bot_token, chat_id
 
 
 def fetch_historical_data(
@@ -102,6 +120,53 @@ def fetch_historical_data(
     return df
 
 
+def send_optimization_notification(
+    notifier: TelegramNotifier,
+    result,
+    config_path: str,
+) -> bool:
+    """Send Telegram notification with optimization results.
+    
+    Args:
+        notifier: TelegramNotifier instance.
+        result: OptimizationResult object.
+        config_path: Path where config was saved.
+        
+    Returns:
+        True if notification sent successfully.
+    """
+    if not notifier.enabled:
+        print("ℹ Telegram notifications disabled - skipping alert")
+        return False
+    
+    r = result.best_result
+    p = result.best_params
+    
+    # Build notification message
+    message = (
+        "<b>🔄 Daily Optimization Complete</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        "<b>📊 Expected Performance:</b>\n"
+        f"  • Win Rate: <b>{r.win_rate:.1f}%</b>\n"
+        f"  • Total PnL: <b>${r.total_pnl:+,.2f}</b> ({r.total_pnl_percent:+.1f}%)\n"
+        f"  • Profit Factor: <b>{r.profit_factor:.2f}</b>\n"
+        f"  • Sharpe Ratio: <b>{r.sharpe_ratio:.2f}</b>\n\n"
+        
+        "<b>⚙️ New Parameters:</b>\n"
+        f"  • MA: {p.get('ma_type', 'SMA')}{p.get('ma_period', 50)}\n"
+        f"  • RSI: {p.get('rsi_period', 14)} ({p.get('rsi_oversold', 30)}/{p.get('rsi_overbought', 70)})\n"
+        f"  • Stop Loss: {p.get('stop_loss_percent', 2.0)}%\n"
+        f"  • Take Profit: {p.get('take_profit_percent', 4.0)}%\n"
+        f"  • VWAP: {'✓' if p.get('use_vwap', True) else '✗'}\n\n"
+        
+        f"<b>✅ {config_path} saved successfully</b>\n"
+        f"Bot will use new settings on next restart/loop."
+    )
+    
+    return notifier._send_message(message)
+
+
 def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
@@ -124,8 +189,25 @@ def main():
     OPTIMIZATION_METRIC = "total_pnl"  # Options: total_pnl, sharpe_ratio, profit_factor, win_rate
     QUICK_MODE = False  # Set to True for faster testing with fewer combinations
     
+    # Output config path (directly overwrite config.json)
+    CONFIG_OUTPUT_PATH = str(PROJECT_ROOT / "config.json")
+    EXISTING_CONFIG_PATH = str(PROJECT_ROOT / "config.json")
+    
+    # Initialize Telegram notifier
+    bot_token, chat_id = load_telegram_credentials()
+    notifier = TelegramNotifier(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        enabled=bool(bot_token and chat_id),
+    )
+    
+    if notifier.enabled:
+        print("✓ Telegram notifications enabled")
+    else:
+        print("ℹ Telegram notifications disabled (no credentials)")
+    
     # Fetch historical data
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("STEP 1: Fetching Historical Data")
     print("=" * 60)
     
@@ -191,26 +273,54 @@ def main():
     # Print report
     print_optimization_report(result)
     
-    # Save config
+    # Save config (merge with existing to preserve notifications, bot settings, etc.)
     print("\n" + "=" * 60)
     print("STEP 3: Saving Optimized Configuration")
     print("=" * 60)
     
-    config_path = result.save_config("config_optimized.json")
-    print(f"\n✓ Saved optimized config to: {config_path}")
-    print("\nTo use these parameters, copy config_optimized.json to config.json:")
-    print("  cp config_optimized.json config.json")
+    # Use smart merging to preserve existing settings
+    config_path = result.save_config(
+        filepath=CONFIG_OUTPUT_PATH,
+        merge_existing=True,
+        existing_config_path=EXISTING_CONFIG_PATH,
+    )
     
-    # Show the config
-    print("\nOptimized config.json content:")
+    print(f"\n✓ Updated config.json with optimized parameters")
+    print(f"  Path: {config_path}")
+    print("\nPreserved settings: notifications, bot, symbols, margin_type, etc.")
+    print("Updated settings: MA, RSI, SL, TP, VWAP, filters")
+    
+    # Show the final config
+    print("\nFinal config.json content:")
     print("-" * 40)
     import json
-    config = result.to_config_json()
+    with open(config_path, "r") as f:
+        config = json.load(f)
     print(json.dumps(config, indent=2))
+    
+    # Send Telegram notification
+    print("\n" + "=" * 60)
+    print("STEP 4: Sending Telegram Notification")
+    print("=" * 60)
+    
+    if send_optimization_notification(notifier, result, "config.json"):
+        print("✓ Telegram notification sent successfully")
+    else:
+        print("ℹ Telegram notification skipped or failed")
+    
+    # Save optimization timestamp
+    timestamp_file = PROJECT_ROOT / "last_optimization.txt"
+    with open(timestamp_file, "w") as f:
+        f.write(f"Last optimization: {datetime.now().isoformat()}\n")
+        f.write(f"Symbol: {SYMBOL}\n")
+        f.write(f"Days analyzed: {DAYS}\n")
+        f.write(f"Best Win Rate: {result.best_result.win_rate:.1f}%\n")
+        f.write(f"Best PnL: ${result.best_result.total_pnl:,.2f}\n")
     
     print("\n" + "=" * 60)
     print("Optimization Complete!")
     print("=" * 60)
+    print("\nThe trading bot will automatically use the new settings on its next loop.")
 
 
 if __name__ == "__main__":

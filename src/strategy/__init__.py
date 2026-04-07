@@ -14,7 +14,7 @@ from .indicators import (
     is_rsi_exiting_overbought,
     is_rsi_exiting_oversold,
 )
-from .signals import Signal, SignalGenerator, SignalResult
+from .signals import FilterResult, Signal, SignalGenerator, SignalResult
 
 __all__ = [
     "add_sma",
@@ -32,4 +32,5 @@ __all__ = [
     "Signal",
     "SignalResult",
     "SignalGenerator",
+    "FilterResult",
 ]

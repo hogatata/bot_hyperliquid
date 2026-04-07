@@ -14,7 +14,7 @@ wheels/
 .env.local
 .env.production
 !.env.example
-bot_hyperliquide.md
+bot_hyperliquid.md
 resume_projet.md
 
 # IDE

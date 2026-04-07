@@ -242,6 +242,91 @@ class HyperliquidClient:
         all_mids = self.info.all_mids()
         return float(all_mids.get(symbol, 0))
 
+    def get_order_book(self, symbol: str) -> dict:
+        """Get the current order book (L2) for a symbol.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC", "ETH").
+
+        Returns:
+            Dict with 'bids' and 'asks' lists: [{"px": price, "sz": size}, ...]
+        """
+        try:
+            l2_data = self.info.l2_snapshot(symbol)
+            return {
+                "bids": [{"px": float(level["px"]), "sz": float(level["sz"])} for level in l2_data.get("levels", [[]])[0]],
+                "asks": [{"px": float(level["px"]), "sz": float(level["sz"])} for level in l2_data.get("levels", [[], []])[1]],
+            }
+        except Exception:
+            return {"bids": [], "asks": []}
+
+    def get_best_bid_ask(self, symbol: str) -> tuple[float, float]:
+        """Get the best bid and ask prices.
+
+        Args:
+            symbol: Trading pair symbol.
+
+        Returns:
+            Tuple of (best_bid, best_ask). Returns (0, 0) if unavailable.
+        """
+        book = self.get_order_book(symbol)
+        best_bid = book["bids"][0]["px"] if book["bids"] else 0.0
+        best_ask = book["asks"][0]["px"] if book["asks"] else 0.0
+        return best_bid, best_ask
+
+    def get_funding_rate(self, symbol: str) -> float:
+        """Get the current funding rate for a perpetual.
+
+        Funding rate is expressed as a percentage (e.g., 0.01 = 0.01%).
+        Positive funding = longs pay shorts (crowded long).
+        Negative funding = shorts pay longs (crowded short).
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC").
+
+        Returns:
+            Current funding rate as percentage. Returns 0.0 if unavailable.
+        """
+        try:
+            meta = self.info.meta()
+            universe = meta.get("universe", [])
+            for asset in universe:
+                if asset.get("name") == symbol:
+                    funding = asset.get("funding", "0")
+                    return float(funding) * 100  # Convert to percentage
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        """Get all open orders, optionally filtered by symbol.
+
+        Args:
+            symbol: Optional symbol to filter by.
+
+        Returns:
+            List of open order dicts.
+        """
+        try:
+            orders = self.info.open_orders(self.wallet_address)
+            if symbol:
+                return [o for o in orders if o.get("coin") == symbol]
+            return orders
+        except Exception:
+            return []
+
+    def cancel_order(self, symbol: str, order_id: int) -> dict:
+        """Cancel a specific order.
+
+        Args:
+            symbol: Trading pair symbol.
+            order_id: Order ID to cancel.
+
+        Returns:
+            API response dict.
+        """
+        return self.exchange.cancel(name=symbol, oid=order_id)
+
     def set_leverage(self, symbol: str, leverage: int, is_cross: bool = False) -> dict:
         """Set leverage for a symbol.
 
@@ -285,3 +370,61 @@ class HyperliquidClient:
             return True
         except Exception:
             return False
+
+    def get_candles_since(
+        self,
+        symbol: str,
+        interval: str,
+        since: datetime,
+    ) -> pd.DataFrame:
+        """Fetch candles from a specific time until now.
+
+        Useful for state recovery to find highest/lowest prices since entry.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC").
+            interval: Candle interval (e.g., "15m", "1h").
+            since: Start datetime.
+
+        Returns:
+            DataFrame with OHLCV data from 'since' until now.
+        """
+        now = datetime.now()
+        
+        # Calculate how many candles we need
+        interval_seconds = self._interval_to_seconds(interval)
+        time_diff = (now - since).total_seconds()
+        estimated_candles = int(time_diff / interval_seconds) + 10  # Buffer
+        
+        return self.get_candles(
+            symbol=symbol,
+            interval=interval,
+            limit=min(estimated_candles, 1000),  # API limit
+            start_time=since,
+            end_time=now,
+        )
+
+    def get_trigger_orders(self, symbol: str | None = None) -> list[dict]:
+        """Get all open trigger orders (SL/TP orders).
+
+        Args:
+            symbol: Optional symbol to filter by.
+
+        Returns:
+            List of trigger order dicts with order details.
+        """
+        try:
+            # Hyperliquid API returns trigger orders separately
+            orders = self.info.open_orders(self.wallet_address)
+            
+            # Filter to only trigger orders
+            trigger_orders = []
+            for order in orders:
+                order_type = order.get("orderType", "")
+                if "trigger" in str(order_type).lower() or order.get("triggerCondition"):
+                    if symbol is None or order.get("coin") == symbol:
+                        trigger_orders.append(order)
+            
+            return trigger_orders
+        except Exception:
+            return []
