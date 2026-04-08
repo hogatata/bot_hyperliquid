@@ -12,6 +12,7 @@ Features:
 - Macro filters: funding rate, volatility (optional)
 - Kill switch (Ctrl+C) for emergency shutdown
 - Live terminal dashboard
+- Interactive Telegram bot for remote control
 """
 
 import signal
@@ -25,11 +26,13 @@ from src.risk import RiskManager, Side
 from src.strategy import Signal, SignalGenerator, add_atr
 from src.utils.logger import setup_logger
 from src.utils.notifier import TelegramNotifier
+from src.utils.telegram_bot import TelegramBotController
 
 # Global flag for graceful shutdown
 shutdown_requested = False
 risk_manager_global = None  # For signal handler access
 notifier_global = None  # For signal handler access
+telegram_bot_global = None  # For Telegram bot controller
 
 
 def clear_screen():
@@ -114,7 +117,7 @@ def print_dashboard(
 
 def kill_switch_handler(signum, frame):
     """Handle Ctrl+C for emergency shutdown."""
-    global shutdown_requested, risk_manager_global, notifier_global
+    global shutdown_requested, risk_manager_global, notifier_global, telegram_bot_global
 
     shutdown_requested = True
 
@@ -124,7 +127,7 @@ def kill_switch_handler(signum, frame):
     print("=" * 60)
 
     if risk_manager_global:
-        print("\n[1/2] Cancelling all pending orders...")
+        print("\n[1/3] Cancelling all pending orders...")
         try:
             results = risk_manager_global.emergency_shutdown()
 
@@ -135,7 +138,7 @@ def kill_switch_handler(signum, frame):
                 status = "✓" if result.success else "✗"
                 print(f"   {status} {result.message}")
 
-            print("\n[2/2] Closing all open positions...")
+            print("\n[2/3] Closing all open positions...")
             for result in closed:
                 status = "✓" if result.success else "✗"
                 print(f"   {status} {result.message}")
@@ -145,6 +148,15 @@ def kill_switch_handler(signum, frame):
 
         except Exception as e:
             print(f"✗ Error during shutdown: {e}")
+
+    # Stop Telegram bot
+    if telegram_bot_global:
+        print("\n[3/3] Stopping Telegram bot...")
+        try:
+            telegram_bot_global.stop()
+            print("✓ Telegram bot stopped")
+        except Exception as e:
+            print(f"✗ Error stopping Telegram bot: {e}")
 
     # Send Telegram notification
     if notifier_global:
@@ -158,7 +170,7 @@ def kill_switch_handler(signum, frame):
 
 def run_bot():
     """Main bot loop."""
-    global risk_manager_global, notifier_global
+    global risk_manager_global, notifier_global, telegram_bot_global
 
     # Register kill switch (Ctrl+C handler)
     signal.signal(signal.SIGINT, kill_switch_handler)
@@ -287,6 +299,22 @@ def run_bot():
         logger.info("✓ Telegram notifications enabled")
     else:
         logger.info("ℹ Telegram notifications disabled")
+
+    # Initialize interactive Telegram bot controller
+    telegram_bot = TelegramBotController(
+        bot_token=settings.telegram_bot_token,
+        authorized_chat_id=settings.telegram_chat_id,
+        client=client,
+        risk_manager=risk_manager,
+        settings=settings,
+        notifier=notifier,
+    )
+    telegram_bot_global = telegram_bot  # For signal handler
+    
+    if telegram_bot.start():
+        logger.info("✓ Telegram bot controller started (interactive commands enabled)")
+    else:
+        logger.info("ℹ Telegram bot controller disabled (no credentials)")
 
     # Display startup info
     logger.info("")
@@ -424,6 +452,9 @@ def run_bot():
                     )
                 else:
                     position_info = "No open position"
+                
+                # Add pause indicator if paused
+                pause_indicator = " ⏸️ PAUSED" if telegram_bot.is_paused else ""
 
                 # Print dashboard
                 clear_screen()
@@ -435,7 +466,7 @@ def run_bot():
                     rsi_zone=result.rsi_zone,
                     vwap=result.vwap_value,
                     ma_value=result.ma_value,
-                    signal_reason=result.reason,
+                    signal_reason=result.reason + pause_indicator,
                     position_info=position_info,
                     balance=balance.account_value,
                     is_testnet=settings.is_testnet,
@@ -445,8 +476,13 @@ def run_bot():
                     features=active_features,
                 )
 
-                # Execute trade if signal and no position
+                # Execute trade if signal and no position (and not paused)
                 if result.signal != Signal.NO_SIGNAL and current_position is None:
+                    # Check if bot is paused via Telegram command
+                    if telegram_bot.is_paused:
+                        logger.info(f"⏸️ Signal detected but bot is PAUSED - skipping {result.signal.name}")
+                        continue
+                    
                     side = Side.LONG if result.signal == Signal.LONG else Side.SHORT
                     order_type = "LIMIT" if settings.risk.use_limit_orders else "MARKET"
 

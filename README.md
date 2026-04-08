@@ -18,6 +18,22 @@ A Python-based algorithmic trading bot for the [Hyperliquid](https://hyperliquid
 - **ATR-Based Risk**: Dynamic SL/TP calculated from market volatility
 - **State Recovery**: Automatically recovers position tracking after bot restarts
 - **Telegram Alerts**: Real-time notifications for trades and bot status
+- **Interactive Telegram Bot**: Remote control via Telegram commands
+
+## 📱 Telegram Bot Commands
+
+The bot includes an interactive Telegram interface for remote monitoring and control:
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Account balance, positions, and unrealized PnL |
+| `/config` | Current configuration summary (strategy, risk) |
+| `/pause` | Pause new trade entries (keeps managing existing positions) |
+| `/resume` | Resume trading |
+| `/panic` | ⚠️ Emergency: Close all positions immediately |
+| `/help` | Show available commands |
+
+**Security**: The bot only responds to the `TELEGRAM_CHAT_ID` defined in your `.env` file.
 
 ## 🎯 Strategy
 
