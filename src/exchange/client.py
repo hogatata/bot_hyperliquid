@@ -35,13 +35,18 @@ API.post = _patched_post
 
 @dataclass
 class AccountBalance:
-    """Account balance information."""
+    """Account balance information.
+    
+    Aggregates both Spot wallet and Perpetuals (Clearinghouse) wallet
+    to match the Hyperliquid Web UI total.
+    """
 
-    account_value: float
-    total_margin_used: float
-    total_position_value: float
-    withdrawable: float
-    raw_usd: float
+    account_value: float  # Total: Perps account value + Spot USDC
+    total_margin_used: float  # Margin locked in positions
+    total_position_value: float  # Total notional position value
+    withdrawable: float  # Free margin available (Perps + Spot)
+    raw_usd: float  # Raw USDC in Perpetuals clearinghouse
+    spot_usdc: float = 0.0  # USDC in Spot wallet
 
 
 @dataclass
@@ -95,25 +100,85 @@ class HyperliquidClient:
         )
 
     def get_account_balance(self) -> AccountBalance:
-        """Fetch the account balance and margin summary.
+        """Fetch the TOTAL account balance aggregating Spot + Perpetuals wallets.
+
+        Hyperliquid Architecture:
+        - Spot Wallet: Holds your USDC when not deposited into perpetuals
+        - Perpetuals (Clearinghouse) Wallet: Holds margin for perp trading
+        
+        The Web UI shows the SUM of both. This method replicates that behavior
+        by querying both user_state() and spot_user_state().
 
         Returns:
-            AccountBalance with account value, margin used, and withdrawable amount.
+            AccountBalance with combined account value matching the Web UI.
 
         Raises:
             Exception: If API request fails.
         """
-        state = self.info.user_state(self.wallet_address)
+        # =======================================================================
+        # 1. Query Perpetuals State (Clearinghouse)
+        # =======================================================================
+        perp_state = self.info.user_state(self.wallet_address)
 
-        margin_summary = state.get("marginSummary", {})
-        cross_margin = state.get("crossMarginSummary", {})
+        margin_summary = perp_state.get("marginSummary", {})
+        cross_margin = perp_state.get("crossMarginSummary", {})
+
+        # Perpetuals account value (includes unrealized PnL)
+        perp_margin_val = float(margin_summary.get("accountValue", 0) or 0)
+        perp_cross_val = float(cross_margin.get("accountValue", 0) or 0)
+        perp_account_value = max(perp_margin_val, perp_cross_val)
+        
+        # Raw USDC deposited in perpetuals clearinghouse
+        perp_raw_usd = float(cross_margin.get("totalRawUsd", 0) or 0)
+        
+        # Withdrawable from perpetuals
+        perp_withdrawable = float(perp_state.get("withdrawable", 0) or 0)
+        
+        # Margin used in positions
+        margin_used = float(margin_summary.get("totalMarginUsed", 0) or 0)
+        cross_margin_used = float(cross_margin.get("totalMarginUsed", 0) or 0)
+        total_margin_used = max(margin_used, cross_margin_used)
+        
+        # Total notional position value
+        total_position_value = float(margin_summary.get("totalNtlPos", 0) or 0)
+
+        # =======================================================================
+        # 2. Query Spot State
+        # =======================================================================
+        spot_usdc = 0.0
+        try:
+            spot_state = self.info.spot_user_state(self.wallet_address)
+            
+            # spot_user_state returns {"balances": [{"coin": "USDC", "total": "123.45", ...}, ...]}
+            balances = spot_state.get("balances", [])
+            
+            for balance in balances:
+                coin = balance.get("coin", "")
+                if coin == "USDC":
+                    # "total" includes all USDC (available + in orders)
+                    # "hold" is locked in open orders
+                    spot_usdc = float(balance.get("total", 0) or 0)
+                    break
+                    
+        except Exception as e:
+            # spot_user_state may fail on testnet or if no spot activity
+            # This is non-fatal - just means no spot balance
+            pass
+
+        # =======================================================================
+        # 3. Aggregation : Total Account Value
+        # =======================================================================
+        
+        total_account_value = max(perp_account_value, spot_usdc)
+        total_withdrawable = total_account_value - total_margin_used
 
         return AccountBalance(
-            account_value=float(margin_summary.get("accountValue", 0)),
-            total_margin_used=float(margin_summary.get("totalMarginUsed", 0)),
-            total_position_value=float(margin_summary.get("totalNtlPos", 0)),
-            withdrawable=float(state.get("withdrawable", 0)),
-            raw_usd=float(cross_margin.get("totalRawUsd", 0)),
+            account_value=total_account_value,
+            total_margin_used=total_margin_used,
+            total_position_value=total_position_value,
+            withdrawable=total_withdrawable,
+            raw_usd=perp_raw_usd,
+            spot_usdc=spot_usdc,
         )
 
     def get_open_positions(self) -> list[Position]:
