@@ -1,9 +1,9 @@
 """Backtesting engine for simulating trading strategies on historical data.
 
-Supports advanced features:
-- Trailing Stop Loss: SL trails price by ATR multiplier when in profit
+Supports ATR-based volatility targeting and Chandelier Exit:
+- Position Size = (Account Balance * risk_percent) / (ATR * sl_multiplier)
+- Chandelier Exit: SL trails by ATR * trail_multiplier (no fixed TP)
 - Volatility Filter: Skips entries when ATR is below threshold
-- Macro Filters simulation for regime detection
 """
 
 from dataclasses import dataclass, field
@@ -28,7 +28,7 @@ class Side(Enum):
 
 @dataclass
 class Trade:
-    """Record of a single trade."""
+    """Record of a single trade with Chandelier Exit tracking."""
     
     entry_time: datetime
     exit_time: Optional[datetime]
@@ -36,20 +36,22 @@ class Trade:
     entry_price: float
     exit_price: Optional[float]
     size: float
-    stop_loss: float
-    take_profit: float
-    atr_at_entry: float = 0.0  # ATR value at entry (for trailing)
-    highest_price: float = 0.0  # Track highest price (for LONG trailing)
-    lowest_price: float = 0.0   # Track lowest price (for SHORT trailing)
+    stop_loss: float  # Initial ATR-based SL
+    atr_at_entry: float  # ATR value at entry (for Chandelier Exit)
+    atr_trailing_multiplier: float  # Chandelier multiplier
+    highest_price: float = 0.0  # Track highest high (for LONG trailing)
+    lowest_price: float = 0.0   # Track lowest low (for SHORT trailing)
     pnl: float = 0.0
     pnl_percent: float = 0.0
-    exit_reason: str = ""  # "stop_loss", "take_profit", "trailing_stop", "signal", "end_of_data"
-    was_filtered: bool = False  # Track if trade was skipped by filter
+    risk_amount: float = 0.0  # USD amount risked
+    calculated_leverage: float = 0.0  # Dynamic leverage used
+    exit_reason: str = ""  # "chandelier_exit", "signal", "end_of_data"
+    was_filtered: bool = False
 
 
 @dataclass
 class BacktestResult:
-    """Results of a backtest run."""
+    """Results of a backtest run with ATR-based risk management."""
     
     # Parameters used
     params: dict
@@ -73,8 +75,9 @@ class BacktestResult:
     sharpe_ratio: float = 0.0
     
     # Advanced metrics
-    trailing_stop_exits: int = 0
+    chandelier_exits: int = 0  # Trades closed by Chandelier Exit
     filtered_signals: int = 0  # Signals blocked by volatility filter
+    average_leverage: float = 0.0  # Average leverage used
     
     # Trade list
     trades: list = field(default_factory=list)
@@ -84,26 +87,26 @@ class BacktestResult:
 
 
 class Backtester:
-    """Backtesting engine that simulates the trading strategy on historical data."""
+    """Backtesting engine with ATR-based volatility targeting and Chandelier Exit."""
     
     def __init__(
         self,
         initial_capital: float = 10000.0,
-        position_size_percent: float = 5.0,
-        leverage: int = 5,
+        risk_percent_per_trade: float = 2.0,
+        max_leverage: int = 10,
         commission_percent: float = 0.05,  # 0.05% per trade (taker fee)
     ):
         """Initialize the backtester.
         
         Args:
             initial_capital: Starting capital in USD.
-            position_size_percent: Percentage of capital per trade.
-            leverage: Leverage multiplier.
+            risk_percent_per_trade: Percentage of capital to risk per trade.
+            max_leverage: Maximum allowed leverage.
             commission_percent: Commission per trade as percentage.
         """
         self.initial_capital = initial_capital
-        self.position_size_percent = position_size_percent
-        self.leverage = leverage
+        self.risk_percent_per_trade = risk_percent_per_trade
+        self.max_leverage = max_leverage
         self.commission_percent = commission_percent
     
     def run(
@@ -114,21 +117,17 @@ class Backtester:
         rsi_period: int = 14,
         rsi_oversold: int = 30,
         rsi_overbought: int = 70,
-        stop_loss_percent: float = 2.0,
-        take_profit_percent: float = 4.0,
         use_vwap: bool = True,
-        # New advanced parameters
-        trailing_stop_enabled: bool = False,
-        trailing_atr_multiplier: float = 1.5,
+        # ATR-based volatility targeting parameters
+        atr_period: int = 14,
+        atr_sl_multiplier: float = 1.5,
+        atr_trailing_multiplier: float = 2.0,
+        # Volatility filter parameters
         volatility_filter_enabled: bool = False,
-        volatility_atr_period: int = 14,
         volatility_lookback: int = 20,
         volatility_threshold: float = 0.5,
-        use_atr_for_sl: bool = False,
-        atr_sl_multiplier: float = 1.5,
-        atr_tp_multiplier: float = 3.0,
     ) -> BacktestResult:
-        """Run backtest with given parameters.
+        """Run backtest with ATR-based volatility targeting and Chandelier Exit.
         
         Args:
             df: DataFrame with OHLCV data.
@@ -137,18 +136,13 @@ class Backtester:
             rsi_period: Period for RSI.
             rsi_oversold: RSI oversold threshold.
             rsi_overbought: RSI overbought threshold.
-            stop_loss_percent: Stop loss as percentage.
-            take_profit_percent: Take profit as percentage.
             use_vwap: Whether to use VWAP in signals.
-            trailing_stop_enabled: Enable trailing stop loss.
-            trailing_atr_multiplier: ATR multiplier for trailing distance.
+            atr_period: ATR period for volatility calculation.
+            atr_sl_multiplier: ATR multiplier for initial stop loss.
+            atr_trailing_multiplier: ATR multiplier for Chandelier Exit trailing.
             volatility_filter_enabled: Enable volatility filter.
-            volatility_atr_period: ATR period for volatility calculation.
             volatility_lookback: Periods to calculate average ATR.
             volatility_threshold: Ratio threshold (current ATR / avg ATR).
-            use_atr_for_sl: Use ATR-based SL instead of percentage.
-            atr_sl_multiplier: ATR multiplier for stop loss.
-            atr_tp_multiplier: ATR multiplier for take profit.
             
         Returns:
             BacktestResult with all metrics and trades.
@@ -160,25 +154,21 @@ class Backtester:
             "rsi_period": rsi_period,
             "rsi_oversold": rsi_oversold,
             "rsi_overbought": rsi_overbought,
-            "stop_loss_percent": stop_loss_percent,
-            "take_profit_percent": take_profit_percent,
             "use_vwap": use_vwap,
-            "leverage": self.leverage,
-            "position_size_percent": self.position_size_percent,
-            # Advanced params
-            "trailing_stop_enabled": trailing_stop_enabled,
-            "trailing_atr_multiplier": trailing_atr_multiplier,
+            "risk_percent_per_trade": self.risk_percent_per_trade,
+            "max_leverage": self.max_leverage,
+            "atr_period": atr_period,
+            "atr_sl_multiplier": atr_sl_multiplier,
+            "atr_trailing_multiplier": atr_trailing_multiplier,
             "volatility_filter_enabled": volatility_filter_enabled,
             "volatility_threshold": volatility_threshold,
-            "use_atr_for_sl": use_atr_for_sl,
-            "atr_sl_multiplier": atr_sl_multiplier,
-            "atr_tp_multiplier": atr_tp_multiplier,
         }
         
         # Add indicators
         df = df.copy()
         ma_column = f"{ma_type.lower()}_{ma_period}"
         rsi_column = f"rsi_{rsi_period}"
+        atr_column = f"atr_{atr_period}"
         
         if ma_type.upper() == "SMA":
             df = add_sma(df, period=ma_period, column_name=ma_column)
@@ -190,19 +180,18 @@ class Backtester:
         if use_vwap:
             df = add_vwap(df)
         
-        # Add ATR for trailing stop and volatility filter
-        atr_column = f"atr_{volatility_atr_period}"
-        df = add_atr(df, period=volatility_atr_period, column_name=atr_column)
+        df = add_atr(df, period=atr_period, column_name=atr_column)
         
         # Initialize state
         capital = self.initial_capital
         equity_curve = [capital]
         trades = []
         current_position: Optional[Trade] = None
-        filtered_signals = 0  # Track filtered entries
+        filtered_signals = 0
+        total_leverage_used = 0.0
         
         # Skip initial rows where indicators are NaN
-        start_idx = max(ma_period, rsi_period) + 1
+        start_idx = max(ma_period, rsi_period, atr_period) + 1
         
         for i in range(start_idx, len(df)):
             row = df.iloc[i]
@@ -210,78 +199,62 @@ class Backtester:
             prev_prev_row = df.iloc[i - 2] if i >= 2 else prev_row
             
             current_price = row["close"]
+            current_high = row["high"]
+            current_low = row["low"]
             current_time = row["timestamp"] if "timestamp" in df.columns else i
             current_atr = row[atr_column] if not pd.isna(row[atr_column]) else 0
             
             # Check if we have a position
             if current_position is not None:
-                # Update trailing stop if enabled
-                if trailing_stop_enabled and current_position.atr_at_entry > 0:
-                    trail_distance = current_position.atr_at_entry * trailing_atr_multiplier
-                    
-                    if current_position.side == Side.LONG:
-                        # Track highest price
-                        if row["high"] > current_position.highest_price:
-                            current_position.highest_price = row["high"]
-                            # Calculate new trailing SL
-                            new_sl = current_position.highest_price - trail_distance
-                            # Only move SL up (never down)
-                            if new_sl > current_position.stop_loss:
-                                current_position.stop_loss = new_sl
-                    else:  # SHORT
-                        # Track lowest price
-                        if row["low"] < current_position.lowest_price:
-                            current_position.lowest_price = row["low"]
-                            # Calculate new trailing SL
-                            new_sl = current_position.lowest_price + trail_distance
-                            # Only move SL down (never up)
-                            if new_sl < current_position.stop_loss:
-                                current_position.stop_loss = new_sl
+                # Update Chandelier Exit trailing stop
+                trail_distance = current_atr * atr_trailing_multiplier
                 
-                # Check for stop loss or take profit
                 if current_position.side == Side.LONG:
-                    # Check SL (price went below)
-                    if row["low"] <= current_position.stop_loss:
+                    # Track highest high
+                    if current_high > current_position.highest_price:
+                        current_position.highest_price = current_high
+                    
+                    # Calculate Chandelier Exit SL
+                    new_sl = current_position.highest_price - trail_distance
+                    
+                    # Only move SL up (ratchet effect)
+                    if new_sl > current_position.stop_loss:
+                        current_position.stop_loss = new_sl
+                    
+                    # Check if SL hit
+                    if current_low <= current_position.stop_loss:
                         exit_price = current_position.stop_loss
-                        exit_reason = "trailing_stop" if trailing_stop_enabled else "stop_loss"
                         current_position = self._close_position(
-                            current_position, exit_price, current_time, exit_reason
+                            current_position, exit_price, current_time, "chandelier_exit"
                         )
                         capital += current_position.pnl
                         trades.append(current_position)
                         current_position = None
-                    # Check TP (price went above)
-                    elif row["high"] >= current_position.take_profit:
-                        exit_price = current_position.take_profit
-                        current_position = self._close_position(
-                            current_position, exit_price, current_time, "take_profit"
-                        )
-                        capital += current_position.pnl
-                        trades.append(current_position)
-                        current_position = None
+                        
                 else:  # SHORT
-                    # Check SL (price went above)
-                    if row["high"] >= current_position.stop_loss:
+                    # Track lowest low
+                    if current_low < current_position.lowest_price:
+                        current_position.lowest_price = current_low
+                    
+                    # Calculate Chandelier Exit SL
+                    new_sl = current_position.lowest_price + trail_distance
+                    
+                    # Only move SL down (ratchet effect)
+                    if new_sl < current_position.stop_loss:
+                        current_position.stop_loss = new_sl
+                    
+                    # Check if SL hit
+                    if current_high >= current_position.stop_loss:
                         exit_price = current_position.stop_loss
-                        exit_reason = "trailing_stop" if trailing_stop_enabled else "stop_loss"
                         current_position = self._close_position(
-                            current_position, exit_price, current_time, exit_reason
-                        )
-                        capital += current_position.pnl
-                        trades.append(current_position)
-                        current_position = None
-                    # Check TP (price went below)
-                    elif row["low"] <= current_position.take_profit:
-                        exit_price = current_position.take_profit
-                        current_position = self._close_position(
-                            current_position, exit_price, current_time, "take_profit"
+                            current_position, exit_price, current_time, "chandelier_exit"
                         )
                         capital += current_position.pnl
                         trades.append(current_position)
                         current_position = None
             
             # Check for entry signals (only if no position)
-            if current_position is None:
+            if current_position is None and current_atr > 0:
                 signal = self._check_signal(
                     row, prev_row, prev_prev_row,
                     ma_column, rsi_column,
@@ -299,27 +272,31 @@ class Backtester:
                             signal = None
                 
                 if signal is not None:
-                    # Calculate position size
-                    position_value = (capital * self.position_size_percent / 100) * self.leverage
-                    size = position_value / current_price
+                    # Calculate ATR-based position sizing (volatility targeting)
+                    risk_amount = capital * (self.risk_percent_per_trade / 100)
+                    sl_distance = current_atr * atr_sl_multiplier
+                    size = risk_amount / sl_distance
                     
-                    # Calculate SL/TP (ATR-based or percentage-based)
-                    if use_atr_for_sl and current_atr > 0:
-                        if signal == Side.LONG:
-                            sl = current_price - (current_atr * atr_sl_multiplier)
-                            tp = current_price + (current_atr * atr_tp_multiplier)
-                        else:
-                            sl = current_price + (current_atr * atr_sl_multiplier)
-                            tp = current_price - (current_atr * atr_tp_multiplier)
+                    # Calculate leverage needed
+                    notional_value = size * current_price
+                    required_leverage = notional_value / capital
+                    calculated_leverage = min(required_leverage, self.max_leverage)
+                    
+                    # Cap position if leverage exceeds max
+                    if required_leverage > self.max_leverage:
+                        max_notional = capital * self.max_leverage
+                        size = max_notional / current_price
+                        risk_amount = size * sl_distance
+                    
+                    total_leverage_used += calculated_leverage
+                    
+                    # Calculate initial SL (no fixed TP - Chandelier Exit handles exit)
+                    if signal == Side.LONG:
+                        sl = current_price - sl_distance
                     else:
-                        if signal == Side.LONG:
-                            sl = current_price * (1 - stop_loss_percent / 100)
-                            tp = current_price * (1 + take_profit_percent / 100)
-                        else:
-                            sl = current_price * (1 + stop_loss_percent / 100)
-                            tp = current_price * (1 - take_profit_percent / 100)
+                        sl = current_price + sl_distance
                     
-                    # Open position with ATR tracking for trailing
+                    # Open position
                     current_position = Trade(
                         entry_time=current_time,
                         exit_time=None,
@@ -328,10 +305,12 @@ class Backtester:
                         exit_price=None,
                         size=size,
                         stop_loss=sl,
-                        take_profit=tp,
                         atr_at_entry=current_atr,
-                        highest_price=current_price,
-                        lowest_price=current_price,
+                        atr_trailing_multiplier=atr_trailing_multiplier,
+                        highest_price=current_high,
+                        lowest_price=current_low,
+                        risk_amount=risk_amount,
+                        calculated_leverage=calculated_leverage,
                     )
             
             # Update equity curve
@@ -357,7 +336,7 @@ class Backtester:
             equity_curve[-1] = capital
         
         # Calculate metrics
-        return self._calculate_metrics(params, trades, equity_curve, filtered_signals)
+        return self._calculate_results(params, trades, equity_curve, filtered_signals, total_leverage_used)
     
     def _check_signal(
         self,
@@ -442,20 +421,24 @@ class Backtester:
         commission = (position.entry_price * position.size * self.commission_percent / 100) * 2
         position.pnl = gross_pnl - commission
         
-        # Calculate percentage
-        position_value = position.entry_price * position.size
-        position.pnl_percent = (position.pnl / position_value) * 100 * self.leverage
+        # Calculate percentage (based on risk amount)
+        if position.risk_amount > 0:
+            position.pnl_percent = (position.pnl / position.risk_amount) * 100
+        else:
+            position_value = position.entry_price * position.size
+            position.pnl_percent = (position.pnl / position_value) * 100
         
         return position
     
-    def _calculate_metrics(
+    def _calculate_results(
         self,
         params: dict,
         trades: list[Trade],
         equity_curve: list[float],
         filtered_signals: int = 0,
+        total_leverage_used: float = 0.0,
     ) -> BacktestResult:
-        """Calculate all backtest metrics."""
+        """Calculate all backtest metrics with ATR-based risk management."""
         
         result = BacktestResult(params=params, trades=trades, equity_curve=equity_curve)
         result.filtered_signals = filtered_signals
@@ -469,8 +452,11 @@ class Backtester:
         result.losing_trades = sum(1 for t in trades if t.pnl < 0)
         result.win_rate = result.winning_trades / result.total_trades * 100
         
-        # Count trailing stop exits
-        result.trailing_stop_exits = sum(1 for t in trades if t.exit_reason == "trailing_stop")
+        # Count Chandelier Exit exits
+        result.chandelier_exits = sum(1 for t in trades if t.exit_reason == "chandelier_exit")
+        
+        # Average leverage used
+        result.average_leverage = total_leverage_used / len(trades) if trades else 0
         
         # PnL metrics
         pnls = [t.pnl for t in trades]

@@ -11,9 +11,8 @@ from dotenv import load_dotenv
 @dataclass
 class TradingConfig:
     symbols: list[str]
-    leverage: int
     margin_type: str
-    position_size_percent: float
+    max_leverage: int = 10
 
 
 @dataclass
@@ -29,15 +28,12 @@ class StrategyConfig:
 
 @dataclass
 class RiskConfig:
-    stop_loss_percent: float
-    take_profit_percent: float
-    use_atr_for_sl: bool
+    risk_percent_per_trade: float
     atr_period: int
-    atr_multiplier: float
+    atr_sl_multiplier: float
+    atr_trailing_multiplier: float
     use_limit_orders: bool = False
     limit_order_timeout: int = 60
-    trailing_stop_enabled: bool = False
-    trailing_atr_multiplier: float = 1.5
 
 
 @dataclass

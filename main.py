@@ -93,7 +93,7 @@ def print_dashboard(
 ╔══════════════════════════════════════════════════════════════╗
 ║          HYPERLIQUID TRADING BOT                             ║
 ╠══════════════════════════════════════════════════════════════╣{RESET}
-║ Mode: {mode}  Features: {CYAN}{features_str:15}{RESET}  Last: {last_update}  ║
+║ Mode: {mode}  Features: {CYAN}{features_str:15}{RESET}  Last: {last_update}║
 ╠══════════════════════════════════════════════════════════════╣
 ║ {BOLD}MARKET DATA{RESET}                                                  ║
 ║  Symbol:     {CYAN}{symbol:10}{RESET}                                      ║
@@ -101,7 +101,7 @@ def print_dashboard(
 ║  Trend:      {trend_color}{trend.upper():10}{RESET} (vs MA: ${ma_value:,.2f})                  ║
 ║  VWAP:       ${vwap:>12,.2f}                                   ║
 ║  RSI:        {rsi_color}{rsi:>6.2f}{RESET} ({rsi_zone})                                ║
-║  Funding:    {funding_color}{funding_rate:>+7.4f}%{RESET}                                       ║
+║  Funding:    {funding_color}{funding_rate:>+7.4f}%{RESET}                                        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║ {BOLD}STRATEGY{RESET}                                                     ║
 ║  {signal_reason:<60}║
@@ -224,24 +224,18 @@ def run_bot():
     )
     logger.info(f"✓ Signal generator initialized ({settings.strategy.daily_ma_type}{settings.strategy.daily_ma_period})")
 
-    # Initialize risk manager with new features
+    # Initialize risk manager with ATR-based volatility targeting
     risk_manager = RiskManager(
         client=client,
-        position_size_percent=settings.trading.position_size_percent,
-        default_leverage=settings.trading.leverage,
-        stop_loss_percent=settings.risk.stop_loss_percent,
-        take_profit_percent=settings.risk.take_profit_percent,
-        use_atr_for_sl=settings.risk.use_atr_for_sl,
-        atr_sl_multiplier=settings.risk.atr_multiplier,
-        atr_tp_multiplier=settings.risk.atr_multiplier * 2,  # 2:1 R:R by default
-        # New features
+        risk_percent_per_trade=settings.risk.risk_percent_per_trade,
+        atr_sl_multiplier=settings.risk.atr_sl_multiplier,
+        atr_trailing_multiplier=settings.risk.atr_trailing_multiplier,
+        max_leverage=settings.trading.max_leverage,
         use_limit_orders=settings.risk.use_limit_orders,
         limit_order_timeout=settings.risk.limit_order_timeout,
-        trailing_stop_enabled=settings.risk.trailing_stop_enabled,
-        trailing_atr_multiplier=settings.risk.trailing_atr_multiplier,
     )
     risk_manager_global = risk_manager  # For signal handler
-    logger.info(f"✓ Risk manager initialized ({settings.trading.leverage}x leverage)")
+    logger.info(f"✓ Risk manager initialized (ATR-based, max {settings.trading.max_leverage}x leverage)")
 
     # ==========================================================================
     # STATE RECOVERY - Check for existing positions on startup
@@ -249,7 +243,7 @@ def run_bot():
     logger.info("Checking for existing positions...")
     recovery_results = risk_manager.recover_state_on_startup(
         symbols=settings.trading.symbols,
-        atr_period=settings.strategy.rsi_period,  # Use same as RSI for consistency
+        atr_period=settings.risk.atr_period,
         candle_interval=settings.strategy.intraday_timeframe,
     )
 
@@ -268,8 +262,6 @@ def run_bot():
                     logger.info(f"     Lowest: ${active.lowest_price:,.2f} | Current SL: ${active.current_sl:,.2f}")
                 if result.get("existing_sl_order"):
                     logger.info(f"     ✓ Existing SL order synced (ID: {result['existing_sl_order']})")
-                if result.get("existing_tp_order"):
-                    logger.info(f"     ✓ Existing TP order synced (ID: {result['existing_tp_order']})")
         elif result.get("position"):
             # Position exists but recovery failed
             logger.warning(f"  ⚠ {symbol}: {result['message']}")
@@ -282,7 +274,7 @@ def run_bot():
     # Build features dict for dashboard
     active_features = {
         "limit_orders": settings.risk.use_limit_orders,
-        "trailing_stop": settings.risk.trailing_stop_enabled,
+        "trailing_stop": True,  # Always using Chandelier Exit now
         "funding_filter": settings.filters.funding_filter_enabled,
         "volatility_filter": settings.filters.volatility_filter_enabled,
     }
@@ -323,15 +315,15 @@ def run_bot():
     logger.info("=" * 50)
     logger.info(f"  Symbols:        {', '.join(settings.trading.symbols)}")
     logger.info(f"  Timeframe:      {settings.strategy.intraday_timeframe}")
-    logger.info(f"  Leverage:       {settings.trading.leverage}x (ISOLATED)")
-    logger.info(f"  Position Size:  {settings.trading.position_size_percent}% of account")
-    logger.info(f"  Stop Loss:      {settings.risk.stop_loss_percent}%")
-    logger.info(f"  Take Profit:    {settings.risk.take_profit_percent}%")
+    logger.info(f"  Max Leverage:   {settings.trading.max_leverage}x (ISOLATED)")
+    logger.info(f"  Risk/Trade:     {settings.risk.risk_percent_per_trade}% of account")
+    logger.info(f"  ATR SL Mult:    {settings.risk.atr_sl_multiplier}x")
+    logger.info(f"  ATR Trail Mult: {settings.risk.atr_trailing_multiplier}x")
     logger.info(f"  Loop Interval:  {settings.bot.loop_interval_seconds}s")
     logger.info("-" * 50)
     logger.info("ADVANCED FEATURES:")
     logger.info(f"  Limit Orders:   {'✓ ENABLED' if settings.risk.use_limit_orders else '✗ Disabled'}")
-    logger.info(f"  Trailing Stop:  {'✓ ENABLED' if settings.risk.trailing_stop_enabled else '✗ Disabled'}")
+    logger.info(f"  Chandelier Exit:✓ ENABLED (ATR Trailing Stop)")
     logger.info(f"  Funding Filter: {'✓ ENABLED' if settings.filters.funding_filter_enabled else '✗ Disabled'}")
     logger.info(f"  Vol Filter:     {'✓ ENABLED' if settings.filters.volatility_filter_enabled else '✗ Disabled'}")
     logger.info(f"  Telegram:       {'✓ ENABLED' if notifier.enabled else '✗ Disabled'}")
@@ -343,8 +335,11 @@ def run_bot():
     notifier.notify_startup(
         is_testnet=settings.is_testnet,
         symbols=settings.trading.symbols,
-        leverage=settings.trading.leverage,
+        leverage=settings.trading.max_leverage,
         features=active_features,
+        risk_percent=settings.risk.risk_percent_per_trade,
+        atr_sl_mult=settings.risk.atr_sl_multiplier,
+        atr_trail_mult=settings.risk.atr_trailing_multiplier,
     )
     
     time.sleep(3)
@@ -373,9 +368,9 @@ def run_bot():
                 # Add indicators
                 df = signal_gen.add_indicators(df)
 
-                # Add ATR if using for SL or trailing stop
-                if settings.risk.use_atr_for_sl or settings.risk.trailing_stop_enabled:
-                    df = add_atr(df, period=settings.risk.atr_period)
+                # Always add ATR for volatility targeting and Chandelier Exit
+                atr_column = f"atr_{settings.risk.atr_period}"
+                df = add_atr(df, period=settings.risk.atr_period, column_name=atr_column)
 
                 # Get funding rate for macro filter
                 funding_rate = 0.0
@@ -396,37 +391,42 @@ def run_bot():
                         current_position = pos
                         break
 
-                # Handle trailing stop for existing positions
+                # Handle Chandelier Exit trailing stop for existing positions
                 trailing_sl_price = None
-                if current_position and settings.risk.trailing_stop_enabled:
-                    current_price = result.current_price
-                    trail_result = risk_manager.update_trailing_stop(symbol, current_price)
+                current_atr = df[atr_column].iloc[-1] if not df.empty else None
+                
+                if current_position:
+                    # Get current candle high/low for Chandelier calculation
+                    current_high = df["high"].iloc[-1]
+                    current_low = df["low"].iloc[-1]
+                    
+                    trail_result = risk_manager.update_chandelier_exit(
+                        symbol=symbol,
+                        current_high=current_high,
+                        current_low=current_low,
+                        current_atr=current_atr,
+                    )
                     if trail_result and trail_result.success:
                         logger.info(f"📈 {trail_result.message}")
+                    
                     # Get current trailing SL for display
                     if symbol in risk_manager.active_positions:
                         trailing_sl_price = risk_manager.active_positions[symbol].current_sl
-                elif not current_position and symbol in risk_manager.active_positions:
-                    # Position closed (hit SL/TP), send notification and clean up tracking
+                        
+                elif symbol in risk_manager.active_positions:
+                    # Position closed (hit Chandelier Exit SL), send notification and clean up
                     closed_pos = risk_manager.active_positions[symbol]
                     
-                    # Determine exit reason and calculate PnL
-                    exit_reason = "stop_loss"  # Default, could be SL or TP
+                    # Calculate PnL - it was a Chandelier Exit (ATR trailing stop)
                     exit_price = result.current_price  # Approximate
+                    exit_reason = "chandelier_exit"
                     
                     if closed_pos.side == Side.LONG:
                         pnl = (exit_price - closed_pos.entry_price) * closed_pos.size
                         pnl_percent = ((exit_price - closed_pos.entry_price) / closed_pos.entry_price) * 100
-                        if exit_price >= closed_pos.entry_price * 1.01:  # Likely TP
-                            exit_reason = "take_profit"
                     else:
                         pnl = (closed_pos.entry_price - exit_price) * closed_pos.size
                         pnl_percent = ((closed_pos.entry_price - exit_price) / closed_pos.entry_price) * 100
-                        if exit_price <= closed_pos.entry_price * 0.99:  # Likely TP for short
-                            exit_reason = "take_profit"
-                    
-                    if settings.risk.trailing_stop_enabled and closed_pos.current_sl != closed_pos.initial_sl:
-                        exit_reason = "trailing_stop"
                     
                     # Send notification
                     notifier.notify_trade_closed(
@@ -439,7 +439,7 @@ def run_bot():
                         exit_reason=exit_reason,
                     )
                     
-                    logger.info(f"📊 Position closed: {symbol} | PnL: ${pnl:+,.2f}")
+                    logger.info(f"📊 Position closed (Chandelier Exit): {symbol} | PnL: ${pnl:+,.2f}")
                     risk_manager.clear_position_tracking(symbol)
 
                 # Format position info
@@ -489,23 +489,21 @@ def run_bot():
                     print(f"\n🚀 SIGNAL DETECTED: {order_type} {side.value.upper()} {symbol}")
                     print("-" * 40)
 
-                    # Prepare trade
+                    # Prepare trade with ATR-based volatility targeting
                     try:
                         setup = risk_manager.prepare_trade(
                             symbol=symbol,
                             side=side,
-                            leverage=settings.trading.leverage,
-                            df_with_indicators=df if (settings.risk.use_atr_for_sl or settings.risk.trailing_stop_enabled) else None,
+                            df_with_indicators=df,
+                            atr_column=atr_column,
                         )
 
                         print(f"   Entry:       ${setup.entry_price:,.2f}")
                         print(f"   Size:        {setup.size} {symbol}")
-                        print(f"   Stop Loss:   ${setup.stop_loss:,.2f}")
-                        print(f"   Take Profit: ${setup.take_profit:,.2f}")
-                        print(f"   Risk:        ${setup.risk_amount:,.2f}")
-                        print(f"   Reward:      ${setup.potential_profit:,.2f}")
-                        if settings.risk.trailing_stop_enabled:
-                            print(f"   Trailing:    ✓ ATR×{settings.risk.trailing_atr_multiplier}")
+                        print(f"   Stop Loss:   ${setup.stop_loss:,.2f} (ATR×{settings.risk.atr_sl_multiplier})")
+                        print(f"   Leverage:    {setup.calculated_leverage}x (dynamic)")
+                        print(f"   Risk:        ${setup.risk_amount:,.2f} ({settings.risk.risk_percent_per_trade}% of account)")
+                        print(f"   Chandelier:  ✓ ATR×{settings.risk.atr_trailing_multiplier}")
                         print("-" * 40)
 
                         # Execute trade
@@ -525,8 +523,8 @@ def run_bot():
                                 entry_price=setup.entry_price,
                                 size=setup.size,
                                 stop_loss=setup.stop_loss,
-                                take_profit=setup.take_profit,
-                                leverage=setup.leverage,
+                                take_profit=None,  # No fixed TP with Chandelier Exit
+                                leverage=setup.calculated_leverage,
                                 order_type=order_type,
                             )
                         else:

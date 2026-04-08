@@ -1,4 +1,4 @@
-"""Risk manager for position sizing, SL/TP, and leverage."""
+"""Risk manager for ATR-based volatility targeting and Chandelier Exit."""
 
 import time
 from dataclasses import dataclass, field
@@ -19,18 +19,17 @@ class Side(Enum):
 
 @dataclass
 class TradeSetup:
-    """Calculated trade parameters."""
+    """Calculated trade parameters for ATR-based volatility targeting."""
 
     symbol: str
     side: Side
     size: float
     entry_price: float
     stop_loss: float
-    take_profit: float
-    leverage: int
-    risk_amount: float  # USD amount at risk
-    potential_profit: float  # USD potential profit
-    atr_value: float = 0.0  # Current ATR for trailing stop
+    calculated_leverage: int  # Dynamic based on position size
+    risk_amount: float  # USD amount at risk (fixed % of account)
+    atr_value: float  # Current ATR for trailing stop
+    sl_distance: float  # ATR * sl_multiplier
 
 
 @dataclass
@@ -45,70 +44,64 @@ class OrderResult:
 
 @dataclass
 class ActivePosition:
-    """Tracks an active position for trailing stop management."""
+    """Tracks an active position for Chandelier Exit trailing stop."""
 
     symbol: str
     side: Side
     entry_price: float
     size: float
-    initial_sl: float
     current_sl: float
     atr_value: float
-    atr_trail_multiplier: float
-    highest_price: float  # Highest favorable price (for trailing)
-    lowest_price: float   # Lowest favorable price (for trailing)
+    atr_trailing_multiplier: float
+    highest_price: float  # For LONG: track highest since entry
+    lowest_price: float   # For SHORT: track lowest since entry
     sl_order_id: Optional[int] = None
-    tp_order_id: Optional[int] = None
 
 
 class RiskManager:
-    """Manages position sizing, SL/TP calculation, and order execution."""
+    """Manages ATR-based volatility targeting and Chandelier Exit trailing stop.
+    
+    Position Sizing (Volatility Targeting):
+    - SL Distance = ATR * atr_sl_multiplier
+    - Position Size = (Account Balance * risk_percent) / SL Distance
+    - No fixed leverage - math dictates the size
+    
+    Trailing Stop (Chandelier Exit):
+    - No fixed Take-Profit
+    - LONG: New SL = max(Prev SL, Highest_High - ATR * atr_trailing_multiplier)
+    - SHORT: New SL = min(Prev SL, Lowest_Low + ATR * atr_trailing_multiplier)
+    """
 
     def __init__(
         self,
         client: HyperliquidClient,
-        position_size_percent: float = 5.0,
-        default_leverage: int = 5,
-        stop_loss_percent: float = 2.0,
-        take_profit_percent: float = 4.0,
-        use_atr_for_sl: bool = False,
+        risk_percent_per_trade: float = 2.0,
         atr_sl_multiplier: float = 1.5,
-        atr_tp_multiplier: float = 3.0,
+        atr_trailing_multiplier: float = 2.0,
+        max_leverage: int = 10,
         use_limit_orders: bool = False,
         limit_order_timeout: int = 60,
-        trailing_stop_enabled: bool = False,
-        trailing_atr_multiplier: float = 1.5,
     ):
         """Initialize the risk manager.
 
         Args:
             client: HyperliquidClient instance.
-            position_size_percent: Percentage of account to use per trade (default 5%).
-            default_leverage: Default leverage (default 5x).
-            stop_loss_percent: Fixed SL as percentage of entry (default 2%).
-            take_profit_percent: Fixed TP as percentage of entry (default 4%).
-            use_atr_for_sl: Use ATR for dynamic SL/TP calculation.
-            atr_sl_multiplier: ATR multiplier for stop loss (default 1.5).
-            atr_tp_multiplier: ATR multiplier for take profit (default 3.0).
+            risk_percent_per_trade: Percentage of account to risk per trade (default 2%).
+            atr_sl_multiplier: ATR multiplier for initial stop loss (default 1.5).
+            atr_trailing_multiplier: ATR multiplier for trailing distance (default 2.0).
+            max_leverage: Maximum allowed leverage (default 10x).
             use_limit_orders: Use limit orders for entry (maker rebates).
             limit_order_timeout: Seconds to wait for limit fill (default 60).
-            trailing_stop_enabled: Enable trailing stop loss.
-            trailing_atr_multiplier: ATR multiplier for trailing distance (default 1.5).
         """
         self.client = client
-        self.position_size_percent = position_size_percent
-        self.default_leverage = default_leverage
-        self.stop_loss_percent = stop_loss_percent
-        self.take_profit_percent = take_profit_percent
-        self.use_atr_for_sl = use_atr_for_sl
+        self.risk_percent_per_trade = risk_percent_per_trade
         self.atr_sl_multiplier = atr_sl_multiplier
-        self.atr_tp_multiplier = atr_tp_multiplier
+        self.atr_trailing_multiplier = atr_trailing_multiplier
+        self.max_leverage = max_leverage
         self.use_limit_orders = use_limit_orders
         self.limit_order_timeout = limit_order_timeout
-        self.trailing_stop_enabled = trailing_stop_enabled
-        self.trailing_atr_multiplier = trailing_atr_multiplier
 
-        # Track active positions for trailing stop
+        # Track active positions for Chandelier Exit
         self.active_positions: dict[str, ActivePosition] = {}
 
     # =========================================================================
@@ -259,13 +252,14 @@ class RiskManager:
                     elif trigger_info.get("tpsl") == "tp":
                         tp_order_id = order.get("oid")
 
-            # Calculate initial SL for reference
+            # Calculate initial SL using ATR
+            sl_distance = current_atr * self.atr_sl_multiplier if current_atr > 0 else entry_price * 0.02
             if current_sl is None:
-                # No existing SL - calculate default
+                # No existing SL - calculate based on ATR
                 if side == Side.LONG:
-                    current_sl = entry_price * (1 - self.stop_loss_percent / 100)
+                    current_sl = entry_price - sl_distance
                 else:
-                    current_sl = entry_price * (1 + self.stop_loss_percent / 100)
+                    current_sl = entry_price + sl_distance
 
             # Create ActivePosition
             active_pos = ActivePosition(
@@ -273,14 +267,12 @@ class RiskManager:
                 side=side,
                 entry_price=entry_price,
                 size=position.size,
-                initial_sl=current_sl,
                 current_sl=current_sl,
-                atr_value=current_atr if current_atr > 0 else entry_price * 0.02,  # Fallback: 2% of price
-                atr_trail_multiplier=self.trailing_atr_multiplier,
+                atr_value=current_atr if current_atr > 0 else entry_price * 0.02,
+                atr_trailing_multiplier=self.atr_trailing_multiplier,
                 highest_price=highest_price,
                 lowest_price=lowest_price,
                 sl_order_id=sl_order_id,
-                tp_order_id=tp_order_id,
             )
 
             # Register in active_positions
@@ -339,10 +331,9 @@ class RiskManager:
         return None
 
     def sync_existing_orders(self, symbol: str) -> dict:
-        """Sync existing SL/TP orders without duplicating them.
+        """Sync existing SL orders without duplicating them.
 
-        Checks for existing orders and updates ActivePosition tracking
-        to match what's already on the exchange.
+        For Chandelier Exit, we only track SL orders (no fixed TP).
 
         Args:
             symbol: Trading symbol.
@@ -357,7 +348,6 @@ class RiskManager:
         existing_orders = self.client.get_open_orders(symbol)
 
         synced_sl = False
-        synced_tp = False
 
         for order in existing_orders:
             order_type = order.get("orderType", {})
@@ -367,36 +357,28 @@ class RiskManager:
                     pos.sl_order_id = order.get("oid")
                     pos.current_sl = float(trigger_info.get("triggerPx", pos.current_sl))
                     synced_sl = True
-                elif trigger_info.get("tpsl") == "tp":
-                    pos.tp_order_id = order.get("oid")
-                    synced_tp = True
 
         return {
             "synced": True,
             "sl_synced": synced_sl,
-            "tp_synced": synced_tp,
             "sl_order_id": pos.sl_order_id,
-            "tp_order_id": pos.tp_order_id,
         }
 
-    def has_existing_sl_tp_orders(self, symbol: str) -> dict:
-        """Check if there are existing SL/TP orders for a symbol.
+    def has_existing_sl_order(self, symbol: str) -> dict:
+        """Check if there is an existing SL order for a symbol.
 
-        Used before placing new orders to avoid duplicates.
+        For Chandelier Exit, we only track SL orders (no fixed TP).
 
         Args:
             symbol: Trading symbol.
 
         Returns:
-            Dict with {has_sl: bool, has_tp: bool, sl_price: float, tp_price: float}
+            Dict with {has_sl: bool, sl_price: float, sl_order_id: int}
         """
         result = {
             "has_sl": False,
-            "has_tp": False,
             "sl_price": None,
-            "tp_price": None,
             "sl_order_id": None,
-            "tp_order_id": None,
         }
 
         try:
@@ -409,169 +391,136 @@ class RiskManager:
                         result["has_sl"] = True
                         result["sl_price"] = float(trigger_info.get("triggerPx", 0))
                         result["sl_order_id"] = order.get("oid")
-                    elif trigger_info.get("tpsl") == "tp":
-                        result["has_tp"] = True
-                        result["tp_price"] = float(trigger_info.get("triggerPx", 0))
-                        result["tp_order_id"] = order.get("oid")
         except Exception:
             pass
 
         return result
 
-    def calculate_position_size(
+    # =========================================================================
+    # ATR-Based Volatility Targeting Position Sizing
+    # =========================================================================
+
+    def calculate_position_size_volatility_target(
         self,
         account_balance: float,
         entry_price: float,
-        leverage: int | None = None,
-    ) -> float:
-        """Calculate position size based on account balance percentage.
+        atr_value: float,
+    ) -> tuple[float, float, float, int]:
+        """Calculate position size using ATR-based volatility targeting.
+        
+        Formula: Position Size = (Account Balance * risk_percent) / SL Distance
+        Where: SL Distance = ATR * atr_sl_multiplier
+        
+        This ensures we risk a fixed percentage of our account per trade,
+        regardless of volatility.
 
         Args:
             account_balance: Total account value in USD.
             entry_price: Expected entry price.
-            leverage: Leverage to use (default: self.default_leverage).
+            atr_value: Current ATR value.
 
         Returns:
-            Position size in base currency units.
+            Tuple of (position_size, sl_distance, risk_amount, calculated_leverage).
         """
-        leverage = leverage or self.default_leverage
+        # Calculate the dollar amount we're willing to risk
+        risk_amount = account_balance * (self.risk_percent_per_trade / 100)
+        
+        # Calculate stop loss distance using ATR
+        sl_distance = atr_value * self.atr_sl_multiplier
+        
+        # Position size = risk_amount / sl_distance (in base currency)
+        position_size = risk_amount / sl_distance
+        
+        # Calculate notional value and required leverage
+        notional_value = position_size * entry_price
+        required_leverage = notional_value / account_balance
+        
+        # Cap leverage at maximum allowed
+        calculated_leverage = min(int(required_leverage) + 1, self.max_leverage)
+        
+        # If required leverage exceeds max, reduce position size
+        if required_leverage > self.max_leverage:
+            max_notional = account_balance * self.max_leverage
+            position_size = max_notional / entry_price
+            # Recalculate risk with capped size
+            risk_amount = position_size * sl_distance
+        
+        return position_size, sl_distance, risk_amount, calculated_leverage
 
-        # Calculate USD amount to trade (% of account * leverage)
-        usd_to_trade = (account_balance * self.position_size_percent / 100) * leverage
-
-        # Convert to base currency size
-        size = usd_to_trade / entry_price
-
-        return size
-
-    def calculate_sl_tp_fixed(
-        self,
-        entry_price: float,
-        side: Side,
-        sl_percent: float | None = None,
-        tp_percent: float | None = None,
-    ) -> tuple[float, float]:
-        """Calculate SL/TP using fixed percentage.
-
-        Args:
-            entry_price: Entry price.
-            side: Trade direction (LONG or SHORT).
-            sl_percent: Stop loss percentage (default: self.stop_loss_percent).
-            tp_percent: Take profit percentage (default: self.take_profit_percent).
-
-        Returns:
-            Tuple of (stop_loss_price, take_profit_price).
-        """
-        sl_pct = sl_percent or self.stop_loss_percent
-        tp_pct = tp_percent or self.take_profit_percent
-
-        if side == Side.LONG:
-            stop_loss = entry_price * (1 - sl_pct / 100)
-            take_profit = entry_price * (1 + tp_pct / 100)
-        else:  # SHORT
-            stop_loss = entry_price * (1 + sl_pct / 100)
-            take_profit = entry_price * (1 - tp_pct / 100)
-
-        return stop_loss, take_profit
-
-    def calculate_sl_tp_atr(
+    def calculate_atr_stop_loss(
         self,
         entry_price: float,
         side: Side,
         atr_value: float,
-        sl_multiplier: float | None = None,
-        tp_multiplier: float | None = None,
-    ) -> tuple[float, float]:
-        """Calculate SL/TP using ATR (dynamic volatility-based).
+    ) -> float:
+        """Calculate initial stop loss using ATR.
 
         Args:
             entry_price: Entry price.
             side: Trade direction (LONG or SHORT).
             atr_value: Current ATR value.
-            sl_multiplier: ATR multiplier for SL (default: self.atr_sl_multiplier).
-            tp_multiplier: ATR multiplier for TP (default: self.atr_tp_multiplier).
 
         Returns:
-            Tuple of (stop_loss_price, take_profit_price).
+            Stop loss price.
         """
-        sl_mult = sl_multiplier or self.atr_sl_multiplier
-        tp_mult = tp_multiplier or self.atr_tp_multiplier
-
-        sl_distance = atr_value * sl_mult
-        tp_distance = atr_value * tp_mult
+        sl_distance = atr_value * self.atr_sl_multiplier
 
         if side == Side.LONG:
-            stop_loss = entry_price - sl_distance
-            take_profit = entry_price + tp_distance
-        else:  # SHORT
-            stop_loss = entry_price + sl_distance
-            take_profit = entry_price - tp_distance
-
-        return stop_loss, take_profit
+            return entry_price - sl_distance
+        else:
+            return entry_price + sl_distance
 
     def prepare_trade(
         self,
         symbol: str,
         side: Side,
-        leverage: int | None = None,
-        df_with_indicators: pd.DataFrame | None = None,
+        df_with_indicators: pd.DataFrame,
         atr_column: str = "atr_14",
     ) -> TradeSetup:
-        """Prepare a complete trade setup with all parameters calculated.
+        """Prepare a trade setup using ATR-based volatility targeting.
 
         Args:
             symbol: Trading symbol (e.g., "BTC").
             side: Trade direction.
-            leverage: Leverage to use (default: self.default_leverage).
-            df_with_indicators: DataFrame with ATR column (required if use_atr_for_sl=True).
+            df_with_indicators: DataFrame with ATR column (REQUIRED).
             atr_column: Name of the ATR column in DataFrame.
 
         Returns:
             TradeSetup with all calculated parameters.
         """
-        leverage = leverage or self.default_leverage
-
         # Get current price and account balance
         entry_price = self.client.get_current_price(symbol)
         balance = self.client.get_account_balance()
         account_value = balance.account_value
 
-        # Calculate position size
-        size = self.calculate_position_size(account_value, entry_price, leverage)
+        # Get ATR value (REQUIRED for volatility targeting)
+        if atr_column not in df_with_indicators.columns:
+            raise ValueError(f"ATR column '{atr_column}' not found in DataFrame")
 
-        # Calculate SL/TP
-        atr_value = 0.0
-        if self.use_atr_for_sl and df_with_indicators is not None:
-            if atr_column not in df_with_indicators.columns:
-                raise ValueError(f"ATR column '{atr_column}' not found in DataFrame")
+        atr_value = df_with_indicators[atr_column].iloc[-1]
+        if pd.isna(atr_value) or atr_value <= 0:
+            raise ValueError("ATR value is NaN or zero - not enough data")
 
-            atr_value = df_with_indicators[atr_column].iloc[-1]
-            if pd.isna(atr_value):
-                raise ValueError("ATR value is NaN - not enough data")
+        # Calculate position size using volatility targeting
+        size, sl_distance, risk_amount, leverage = self.calculate_position_size_volatility_target(
+            account_balance=account_value,
+            entry_price=entry_price,
+            atr_value=atr_value,
+        )
 
-            stop_loss, take_profit = self.calculate_sl_tp_atr(entry_price, side, atr_value)
-        else:
-            stop_loss, take_profit = self.calculate_sl_tp_fixed(entry_price, side)
-
-        # Calculate risk/reward
-        if side == Side.LONG:
-            risk_amount = (entry_price - stop_loss) * size
-            potential_profit = (take_profit - entry_price) * size
-        else:
-            risk_amount = (stop_loss - entry_price) * size
-            potential_profit = (entry_price - take_profit) * size
+        # Calculate stop loss
+        stop_loss = self.calculate_atr_stop_loss(entry_price, side, atr_value)
 
         return TradeSetup(
             symbol=symbol,
             side=side,
-            size=round(size, 6),  # Round to reasonable precision
+            size=round(size, 6),
             entry_price=entry_price,
             stop_loss=round(stop_loss, 2),
-            take_profit=round(take_profit, 2),
-            leverage=leverage,
+            calculated_leverage=leverage,
             risk_amount=round(risk_amount, 2),
-            potential_profit=round(potential_profit, 2),
-            atr_value=atr_value if self.use_atr_for_sl and df_with_indicators is not None else 0.0,
+            atr_value=atr_value,
+            sl_distance=sl_distance,
         )
 
     def execute_trade(
@@ -579,21 +528,20 @@ class RiskManager:
         setup: TradeSetup,
         dry_run: bool = False,
     ) -> dict[str, OrderResult]:
-        """Execute a complete trade with SL/TP orders.
+        """Execute a trade with Chandelier Exit (ATR trailing stop).
 
         Flow:
         1. Set leverage (isolated margin)
         2. Place entry order (market or limit based on use_limit_orders)
-        3. Place stop loss order
-        4. Place take profit order
-        5. Register position for trailing stop (if enabled)
+        3. Place initial stop loss order
+        4. Register position for Chandelier Exit trailing stop
 
         Args:
             setup: TradeSetup with all parameters.
             dry_run: If True, don't actually place orders (for testing).
 
         Returns:
-            Dict with results for each step: {"leverage", "entry", "stop_loss", "take_profit"}
+            Dict with results for each step: {"leverage", "entry", "stop_loss"}
         """
         results = {}
         is_buy = setup.side == Side.LONG
@@ -602,18 +550,18 @@ class RiskManager:
         if dry_run:
             results["leverage"] = OrderResult(
                 success=True,
-                message=f"[DRY RUN] Would set leverage to {setup.leverage}x isolated",
+                message=f"[DRY RUN] Would set leverage to {setup.calculated_leverage}x isolated",
             )
         else:
             try:
                 response = self.client.set_leverage(
                     symbol=setup.symbol,
-                    leverage=setup.leverage,
+                    leverage=setup.calculated_leverage,
                     is_cross=False,  # ISOLATED margin as per spec
                 )
                 results["leverage"] = OrderResult(
                     success=True,
-                    message=f"Leverage set to {setup.leverage}x isolated",
+                    message=f"Leverage set to {setup.calculated_leverage}x isolated",
                     details=response,
                 )
             except Exception as e:
@@ -657,32 +605,19 @@ class RiskManager:
             results["stop_loss"] = self._place_stop_loss(setup, is_buy)
             sl_order_id = results["stop_loss"].order_id
 
-        # Step 4: Place Take Profit order (trigger order, reduce_only)
-        tp_order_id = None
-        if dry_run:
-            results["take_profit"] = OrderResult(
-                success=True,
-                message=f"[DRY RUN] Would place TP @ ${setup.take_profit:,.2f}",
-            )
-        else:
-            results["take_profit"] = self._place_take_profit(setup, is_buy)
-            tp_order_id = results["take_profit"].order_id
-
-        # Step 5: Register for trailing stop management (if enabled)
-        if self.trailing_stop_enabled and not dry_run and results["entry"].success:
+        # Step 4: Register for Chandelier Exit trailing stop management
+        if not dry_run and results["entry"].success:
             self.active_positions[setup.symbol] = ActivePosition(
                 symbol=setup.symbol,
                 side=setup.side,
                 entry_price=actual_entry_price,
                 size=setup.size,
-                initial_sl=setup.stop_loss,
                 current_sl=setup.stop_loss,
                 atr_value=setup.atr_value,
-                atr_trail_multiplier=self.trailing_atr_multiplier,
+                atr_trailing_multiplier=self.atr_trailing_multiplier,
                 highest_price=actual_entry_price,
                 lowest_price=actual_entry_price,
                 sl_order_id=sl_order_id,
-                tp_order_id=tp_order_id,
             )
 
         return results
@@ -872,14 +807,24 @@ class RiskManager:
                 return float(statuses[0]["filled"].get("avgPx", 0))
         return None
 
-    def update_trailing_stop(self, symbol: str, current_price: float) -> OrderResult | None:
-        """Update trailing stop if price moved in our favor.
+    def update_chandelier_exit(
+        self, 
+        symbol: str, 
+        current_high: float, 
+        current_low: float,
+        current_atr: float | None = None,
+    ) -> OrderResult | None:
+        """Update Chandelier Exit trailing stop.
 
-        Called from main loop to manage trailing stops locally.
+        Chandelier Exit Logic:
+        - LONG: New SL = max(Prev SL, Highest_High - ATR * atr_trailing_multiplier)
+        - SHORT: New SL = min(Prev SL, Lowest_Low + ATR * atr_trailing_multiplier)
 
         Args:
             symbol: Trading symbol.
-            current_price: Current market price.
+            current_high: Current candle high (used to update highest_price for LONG).
+            current_low: Current candle low (used to update lowest_price for SHORT).
+            current_atr: Current ATR value (optional - uses stored ATR if not provided).
 
         Returns:
             OrderResult if SL was updated, None otherwise.
@@ -888,38 +833,41 @@ class RiskManager:
             return None
 
         pos = self.active_positions[symbol]
+        
+        # Use provided ATR or fall back to stored value
+        atr_value = current_atr if current_atr is not None else pos.atr_value
 
-        # Calculate new stop based on direction
         if pos.side == Side.LONG:
-            # Track highest price for long positions
-            if current_price > pos.highest_price:
-                pos.highest_price = current_price
+            # Track highest high for long positions
+            if current_high > pos.highest_price:
+                pos.highest_price = current_high
 
-                # Calculate new SL based on highest price
-                trail_distance = pos.atr_value * pos.atr_trail_multiplier
-                new_sl = pos.highest_price - trail_distance
+            # Calculate Chandelier Exit: Highest_High - ATR * multiplier
+            trail_distance = atr_value * pos.atr_trailing_multiplier
+            new_sl = pos.highest_price - trail_distance
 
-                # Only move SL up, never down
-                if new_sl > pos.current_sl:
-                    return self._update_sl_order(pos, new_sl)
+            # Only move SL up, never down (ratchet effect)
+            if new_sl > pos.current_sl:
+                return self._update_sl_order(pos, new_sl)
 
         else:  # SHORT
-            # Track lowest price for short positions
-            if current_price < pos.lowest_price:
-                pos.lowest_price = current_price
+            # Track lowest low for short positions
+            if current_low < pos.lowest_price:
+                pos.lowest_price = current_low
 
-                # Calculate new SL based on lowest price
-                trail_distance = pos.atr_value * pos.atr_trail_multiplier
-                new_sl = pos.lowest_price + trail_distance
+            # Calculate Chandelier Exit: Lowest_Low + ATR * multiplier
+            trail_distance = atr_value * pos.atr_trailing_multiplier
+            new_sl = pos.lowest_price + trail_distance
 
-                # Only move SL down, never up
-                if new_sl < pos.current_sl:
-                    return self._update_sl_order(pos, new_sl)
+            # Only move SL down, never up (ratchet effect)
+            if new_sl < pos.current_sl:
+                return self._update_sl_order(pos, new_sl)
 
         return None
 
     def _update_sl_order(self, pos: ActivePosition, new_sl: float) -> OrderResult:
         """Cancel old SL and place new one at updated price."""
+        old_sl = pos.current_sl
         try:
             # Cancel existing SL order
             if pos.sl_order_id:
@@ -949,18 +897,18 @@ class RiskManager:
                 return OrderResult(
                     success=True,
                     order_id=pos.sl_order_id,
-                    message=f"Trailing SL updated: ${pos.initial_sl:,.2f} → ${new_sl:,.2f}",
+                    message=f"Chandelier Exit SL updated: ${old_sl:,.2f} → ${new_sl:,.2f}",
                     details=response,
                 )
             else:
                 return OrderResult(
                     success=False,
-                    message=f"Failed to update trailing SL: {response}",
+                    message=f"Failed to update Chandelier Exit SL: {response}",
                 )
         except Exception as e:
             return OrderResult(
                 success=False,
-                message=f"Error updating trailing SL: {e}",
+                message=f"Error updating Chandelier Exit SL: {e}",
             )
 
     def clear_position_tracking(self, symbol: str):

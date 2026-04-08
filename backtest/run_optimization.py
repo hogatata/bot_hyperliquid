@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run parameter optimization on historical data.
+"""Run parameter optimization for ATR-based volatility targeting.
 
 Usage:
     uv run python backtest/run_optimization.py
     
 This script:
 1. Fetches last 30 days of candle data from Hyperliquid
-2. Runs grid search optimization on strategy parameters
+2. Runs grid search optimization for ATR SL/trailing multipliers
 3. Prints a detailed report
 4. Directly overwrites config.json with optimized settings
 5. Sends Telegram notification with results
@@ -125,7 +125,7 @@ def send_optimization_notification(
     result,
     config_path: str,
 ) -> bool:
-    """Send Telegram notification with optimization results.
+    """Send Telegram notification with ATR-based optimization results.
     
     Args:
         notifier: TelegramNotifier instance.
@@ -142,7 +142,7 @@ def send_optimization_notification(
     r = result.best_result
     p = result.best_params
     
-    # Build notification message
+    # Build notification message for ATR-based volatility targeting
     message = (
         "<b>🔄 Daily Optimization Complete</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -151,13 +151,14 @@ def send_optimization_notification(
         f"  • Win Rate: <b>{r.win_rate:.1f}%</b>\n"
         f"  • Total PnL: <b>${r.total_pnl:+,.2f}</b> ({r.total_pnl_percent:+.1f}%)\n"
         f"  • Profit Factor: <b>{r.profit_factor:.2f}</b>\n"
-        f"  • Sharpe Ratio: <b>{r.sharpe_ratio:.2f}</b>\n\n"
+        f"  • Sharpe Ratio: <b>{r.sharpe_ratio:.2f}</b>\n"
+        f"  • Avg Leverage: <b>{r.average_leverage:.1f}x</b>\n\n"
         
-        "<b>⚙️ New Parameters:</b>\n"
+        "<b>⚙️ ATR-Based Parameters:</b>\n"
         f"  • MA: {p.get('ma_type', 'SMA')}{p.get('ma_period', 50)}\n"
         f"  • RSI: {p.get('rsi_period', 14)} ({p.get('rsi_oversold', 30)}/{p.get('rsi_overbought', 70)})\n"
-        f"  • Stop Loss: {p.get('stop_loss_percent', 2.0)}%\n"
-        f"  • Take Profit: {p.get('take_profit_percent', 4.0)}%\n"
+        f"  • ATR SL Mult: <b>{p.get('atr_sl_multiplier', 1.5)}x</b>\n"
+        f"  • ATR Trail Mult: <b>{p.get('atr_trailing_multiplier', 2.0)}x</b>\n"
         f"  • VWAP: {'✓' if p.get('use_vwap', True) else '✗'}\n\n"
         
         f"<b>✅ {config_path} saved successfully</b>\n"
@@ -170,9 +171,9 @@ def send_optimization_notification(
 def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║     HYPERLIQUID BOT - PARAMETER OPTIMIZER                 ║
+    ║     HYPERLIQUID BOT - ATR VOLATILITY OPTIMIZER            ║
     ║     ─────────────────────────────────────                 ║
-    ║     Grid search for optimal strategy parameters           ║
+    ║     Grid search for ATR SL/Trailing multipliers           ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
@@ -183,8 +184,8 @@ def main():
     USE_TESTNET = False  # Use mainnet for real historical data
     
     INITIAL_CAPITAL = 10000.0
-    POSITION_SIZE_PERCENT = 5.0
-    LEVERAGE = 5
+    RISK_PERCENT_PER_TRADE = 2.0  # Risk 2% per trade
+    MAX_LEVERAGE = 10
     
     OPTIMIZATION_METRIC = "total_pnl"  # Options: total_pnl, sharpe_ratio, profit_factor, win_rate
     QUICK_MODE = False  # Set to True for faster testing with fewer combinations
@@ -247,13 +248,13 @@ def main():
     
     # Run optimization
     print("\n" + "=" * 60)
-    print("STEP 2: Running Parameter Optimization")
+    print("STEP 2: Running ATR Parameter Optimization")
     print("=" * 60 + "\n")
     
     optimizer = ParameterOptimizer(
         initial_capital=INITIAL_CAPITAL,
-        position_size_percent=POSITION_SIZE_PERCENT,
-        leverage=LEVERAGE,
+        risk_percent_per_trade=RISK_PERCENT_PER_TRADE,
+        max_leverage=MAX_LEVERAGE,
     )
     
     if QUICK_MODE:
@@ -285,10 +286,10 @@ def main():
         existing_config_path=EXISTING_CONFIG_PATH,
     )
     
-    print(f"\n✓ Updated config.json with optimized parameters")
+    print(f"\n✓ Updated config.json with optimized ATR parameters")
     print(f"  Path: {config_path}")
     print("\nPreserved settings: notifications, bot, symbols, margin_type, etc.")
-    print("Updated settings: MA, RSI, SL, TP, VWAP, filters")
+    print("Updated settings: MA, RSI, ATR SL mult, ATR trailing mult, VWAP, filters")
     
     # Show the final config
     print("\nFinal config.json content:")
@@ -316,6 +317,8 @@ def main():
         f.write(f"Days analyzed: {DAYS}\n")
         f.write(f"Best Win Rate: {result.best_result.win_rate:.1f}%\n")
         f.write(f"Best PnL: ${result.best_result.total_pnl:,.2f}\n")
+        f.write(f"Best ATR SL Mult: {result.best_params.get('atr_sl_multiplier', 'N/A')}\n")
+        f.write(f"Best ATR Trail Mult: {result.best_params.get('atr_trailing_multiplier', 'N/A')}\n")
     
     print("\n" + "=" * 60)
     print("Optimization Complete!")

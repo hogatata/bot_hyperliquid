@@ -1,4 +1,4 @@
-"""Parameter optimizer using grid search to find best strategy parameters."""
+"""Parameter optimizer using grid search for ATR-based volatility targeting."""
 
 import json
 from dataclasses import dataclass, field
@@ -14,7 +14,7 @@ from .backtester import Backtester, BacktestResult
 
 @dataclass
 class OptimizationResult:
-    """Results from parameter optimization."""
+    """Results from parameter optimization for ATR-based risk management."""
     
     best_params: dict
     best_result: BacktestResult
@@ -22,7 +22,7 @@ class OptimizationResult:
     optimization_metric: str = "total_pnl"
     
     def to_config_updates(self) -> dict:
-        """Convert best parameters to config updates (only optimizable fields).
+        """Convert best parameters to config updates for volatility targeting.
         
         Returns a dict with only the sections that should be updated,
         preserving the structure expected by merge_with_existing_config.
@@ -30,8 +30,7 @@ class OptimizationResult:
         p = self.best_params
         return {
             "trading": {
-                "leverage": p.get("leverage", 5),
-                "position_size_percent": p.get("position_size_percent", 5.0),
+                "max_leverage": p.get("max_leverage", 10),
             },
             "strategy": {
                 "daily_ma_type": p.get("ma_type", "SMA"),
@@ -42,12 +41,10 @@ class OptimizationResult:
                 "vwap_enabled": p.get("use_vwap", True),
             },
             "risk_management": {
-                "stop_loss_percent": p.get("stop_loss_percent", 2.0),
-                "take_profit_percent": p.get("take_profit_percent", 4.0),
-                "use_atr_for_sl": p.get("use_atr_for_sl", False),
-                "atr_multiplier": p.get("atr_sl_multiplier", 1.5),
-                "trailing_stop_enabled": p.get("trailing_stop_enabled", False),
-                "trailing_atr_multiplier": p.get("trailing_atr_multiplier", 1.5),
+                "risk_percent_per_trade": p.get("risk_percent_per_trade", 2.0),
+                "atr_period": p.get("atr_period", 14),
+                "atr_sl_multiplier": p.get("atr_sl_multiplier", 1.5),
+                "atr_trailing_multiplier": p.get("atr_trailing_multiplier", 2.0),
             },
             "filters": {
                 "volatility_filter_enabled": p.get("volatility_filter_enabled", False),
@@ -60,10 +57,9 @@ class OptimizationResult:
         p = self.best_params
         return {
             "trading": {
-                "symbols": ["BTC", "ETH"],
-                "leverage": p.get("leverage", 5),
+                "symbols": ["BTC"],
                 "margin_type": "isolated",
-                "position_size_percent": p.get("position_size_percent", 5.0)
+                "max_leverage": p.get("max_leverage", 10)
             },
             "strategy": {
                 "daily_ma_type": p.get("ma_type", "SMA"),
@@ -75,15 +71,12 @@ class OptimizationResult:
                 "vwap_enabled": p.get("use_vwap", True)
             },
             "risk_management": {
-                "stop_loss_percent": p.get("stop_loss_percent", 2.0),
-                "take_profit_percent": p.get("take_profit_percent", 4.0),
-                "use_atr_for_sl": p.get("use_atr_for_sl", False),
-                "atr_period": 14,
-                "atr_multiplier": p.get("atr_sl_multiplier", 1.5),
-                "use_limit_orders": False,
-                "limit_order_timeout": 60,
-                "trailing_stop_enabled": p.get("trailing_stop_enabled", False),
-                "trailing_atr_multiplier": p.get("trailing_atr_multiplier", 1.5)
+                "risk_percent_per_trade": p.get("risk_percent_per_trade", 2.0),
+                "atr_period": p.get("atr_period", 14),
+                "atr_sl_multiplier": p.get("atr_sl_multiplier", 1.5),
+                "atr_trailing_multiplier": p.get("atr_trailing_multiplier", 2.0),
+                "use_limit_orders": True,
+                "limit_order_timeout": 60
             },
             "filters": {
                 "funding_filter_enabled": False,
@@ -96,6 +89,9 @@ class OptimizationResult:
             "bot": {
                 "loop_interval_seconds": 60,
                 "log_level": "INFO"
+            },
+            "notifications": {
+                "enable_telegram_alerts": True
             }
         }
     
@@ -162,58 +158,54 @@ class OptimizationResult:
 
 
 class ParameterOptimizer:
-    """Grid search optimizer for strategy parameters."""
+    """Grid search optimizer for ATR-based volatility targeting parameters."""
     
-    # Default parameter grids (including advanced features)
+    # Default parameter grids for ATR-based volatility targeting
     DEFAULT_GRIDS = {
         "ma_type": ["SMA", "EMA"],
         "ma_period": [20, 50, 100],
         "rsi_period": [7, 14, 21],
         "rsi_oversold": [25, 30, 35],
         "rsi_overbought": [65, 70, 75],
-        "stop_loss_percent": [1.0, 1.5, 2.0, 2.5, 3.0],
-        "take_profit_percent": [2.0, 3.0, 4.0, 5.0, 6.0],
         "use_vwap": [True, False],
+        # ATR-based volatility targeting parameters
+        "atr_sl_multiplier": [1.0, 1.5, 2.0, 2.5],
+        "atr_trailing_multiplier": [1.5, 2.0, 3.0],
     }
     
-    # Extended grids including trailing stop and volatility filter
+    # Extended grids including volatility filter
     ADVANCED_GRIDS = {
         "ma_type": ["SMA", "EMA"],
         "ma_period": [20, 50, 100],
         "rsi_period": [14],
         "rsi_oversold": [30],
         "rsi_overbought": [70],
-        "stop_loss_percent": [1.5, 2.0, 2.5],
-        "take_profit_percent": [3.0, 4.0, 5.0],
         "use_vwap": [True, False],
-        # Trailing stop params
-        "trailing_stop_enabled": [True, False],
-        "trailing_atr_multiplier": [1.0, 1.5, 2.0],
+        # ATR-based volatility targeting
+        "atr_sl_multiplier": [1.0, 1.5, 2.0, 2.5, 3.0],
+        "atr_trailing_multiplier": [1.5, 2.0, 2.5, 3.0, 4.0],
         # Volatility filter params
         "volatility_filter_enabled": [True, False],
         "volatility_threshold": [0.3, 0.5, 0.7],
-        # ATR-based SL params
-        "use_atr_for_sl": [True, False],
-        "atr_sl_multiplier": [1.0, 1.5, 2.0],
     }
     
     def __init__(
         self,
         initial_capital: float = 10000.0,
-        position_size_percent: float = 5.0,
-        leverage: int = 5,
+        risk_percent_per_trade: float = 2.0,
+        max_leverage: int = 10,
     ):
-        """Initialize the optimizer.
+        """Initialize the optimizer for ATR-based volatility targeting.
         
         Args:
             initial_capital: Starting capital for backtests.
-            position_size_percent: Position size as % of capital.
-            leverage: Leverage multiplier.
+            risk_percent_per_trade: Percentage of capital to risk per trade.
+            max_leverage: Maximum allowed leverage.
         """
         self.backtester = Backtester(
             initial_capital=initial_capital,
-            position_size_percent=position_size_percent,
-            leverage=leverage,
+            risk_percent_per_trade=risk_percent_per_trade,
+            max_leverage=max_leverage,
         )
     
     def optimize(
@@ -308,9 +300,10 @@ class ParameterOptimizer:
             "rsi_period": [14],
             "rsi_oversold": [30],
             "rsi_overbought": [70],
-            "stop_loss_percent": [1.5, 2.0, 2.5],
-            "take_profit_percent": [3.0, 4.0, 5.0],
             "use_vwap": [True, False],
+            # ATR-based volatility targeting
+            "atr_sl_multiplier": [1.5, 2.0],
+            "atr_trailing_multiplier": [2.0, 3.0],
         }
         
         return self.optimize(df, quick_grids, metric, show_progress=show_progress)
@@ -322,12 +315,12 @@ class ParameterOptimizer:
         min_trades: int = 5,
         show_progress: bool = True,
     ) -> OptimizationResult:
-        """Run optimization including advanced features (trailing stop, volatility filter).
+        """Run optimization for ATR-based volatility targeting with full grid.
         
         This tests a larger parameter space including:
-        - Trailing stop with different ATR multipliers
+        - Various ATR SL multipliers (1.0 to 3.0)
+        - Various ATR trailing multipliers (1.5 to 4.0)
         - Volatility filter with different thresholds
-        - ATR-based stop loss
         
         Warning: This can be slow due to the large search space.
         """
@@ -406,7 +399,7 @@ def print_optimization_report(result: OptimizationResult):
         metric_val = getattr(res, result.optimization_metric, 0)
         print(f"\n  #{i}: {result.optimization_metric}={metric_val:.2f}")
         print(f"      MA: {p['ma_type']}{p['ma_period']}, RSI: {p['rsi_period']} ({p['rsi_oversold']}/{p['rsi_overbought']})")
-        print(f"      SL: {p['stop_loss_percent']}%, TP: {p['take_profit_percent']}%, VWAP: {p['use_vwap']}")
+        print(f"      ATR SLx: {p['atr_sl_multiplier']}, ATR Trailx: {p['atr_trailing_multiplier']}, VWAP: {p['use_vwap']}")
         print(f"      Trades: {res.total_trades}, Win Rate: {res.win_rate:.1f}%, PF: {res.profit_factor:.2f}")
     
     print("\n" + "=" * 60)

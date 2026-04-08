@@ -1,0 +1,7 @@
+Last optimization: 2026-04-08T15:26:21.329839
+Symbol: BTC
+Days analyzed: 30
+Best Win Rate: 80.0%
+Best PnL: $643.84
+Best ATR SL Mult: 1.0
+Best ATR Trail Mult: 2.0

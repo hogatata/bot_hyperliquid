@@ -127,14 +127,20 @@ class TelegramNotifier:
         symbols: list[str],
         leverage: int,
         features: Optional[dict] = None,
+        risk_percent: Optional[float] = None,
+        atr_sl_mult: Optional[float] = None,
+        atr_trail_mult: Optional[float] = None,
     ) -> bool:
         """Notify that the bot has started.
         
         Args:
             is_testnet: Whether running on testnet.
             symbols: List of trading symbols.
-            leverage: Configured leverage.
+            leverage: Maximum allowed leverage.
             features: Dict of enabled features.
+            risk_percent: Risk percentage per trade (for ATR volatility targeting).
+            atr_sl_mult: ATR multiplier for initial stop loss.
+            atr_trail_mult: ATR multiplier for Chandelier Exit trailing.
         """
         mode = "TESTNET" if is_testnet else "⚠️ MAINNET"
         symbols_str = ", ".join(symbols)
@@ -145,7 +151,7 @@ class TelegramNotifier:
         if features.get("limit_orders"):
             feature_list.append("Limit Orders")
         if features.get("trailing_stop"):
-            feature_list.append("Trailing Stop")
+            feature_list.append("Chandelier Exit")
         if features.get("funding_filter"):
             feature_list.append("Funding Filter")
         if features.get("volatility_filter"):
@@ -153,11 +159,20 @@ class TelegramNotifier:
         
         features_str = ", ".join(feature_list) if feature_list else "Standard"
         
+        # Build risk management info
+        risk_info = ""
+        if risk_percent is not None:
+            risk_info = f"\n• Risk/Trade: {risk_percent}%"
+        if atr_sl_mult is not None:
+            risk_info += f"\n• ATR SL: {atr_sl_mult}x"
+        if atr_trail_mult is not None:
+            risk_info += f"\n• ATR Trail: {atr_trail_mult}x"
+        
         message = f"""🤖 <b>Bot Started on {mode}</b>
 
 📊 <b>Configuration:</b>
 • Symbols: {symbols_str}
-• Leverage: {leverage}x
+• Max Leverage: {leverage}x{risk_info}
 • Features: {features_str}
 
 Bot is now monitoring the markets."""
@@ -189,7 +204,7 @@ All orders cancelled. Positions closed."""
         entry_price: float,
         size: float,
         stop_loss: float,
-        take_profit: float,
+        take_profit: float | None,
         leverage: int,
         order_type: str = "MARKET",
     ) -> bool:
@@ -201,25 +216,34 @@ All orders cancelled. Positions closed."""
             entry_price: Entry price.
             size: Position size.
             stop_loss: Stop loss price.
-            take_profit: Take profit price.
+            take_profit: Take profit price (None for Chandelier Exit mode).
             leverage: Leverage used.
             order_type: Order type ("MARKET" or "LIMIT").
         """
         emoji = "🟢" if side.upper() == "LONG" else "🔴"
         
-        # Calculate risk/reward
+        # Calculate risk percentage
         if side.upper() == "LONG":
             risk_pct = ((entry_price - stop_loss) / entry_price) * 100
-            reward_pct = ((take_profit - entry_price) / entry_price) * 100
         else:
             risk_pct = ((stop_loss - entry_price) / entry_price) * 100
-            reward_pct = ((entry_price - take_profit) / entry_price) * 100
+        
+        # Build message based on whether we have a fixed TP or Chandelier Exit
+        if take_profit is not None:
+            if side.upper() == "LONG":
+                reward_pct = ((take_profit - entry_price) / entry_price) * 100
+            else:
+                reward_pct = ((entry_price - take_profit) / entry_price) * 100
+            
+            tp_line = f"🎯 TP: ${take_profit:,.2f} (+{reward_pct:.1f}%)"
+        else:
+            tp_line = "🎯 TP: Chandelier Exit (trailing)"
         
         message = f"""{emoji} <b>{side.upper()} {symbol} Executed</b>
 
 📍 Entry: ${entry_price:,.2f}
 📦 Size: {size:.4f} {symbol}
-🎯 TP: ${take_profit:,.2f} (+{reward_pct:.1f}%)
+{tp_line}
 🛡️ SL: ${stop_loss:,.2f} (-{risk_pct:.1f}%)
 ⚡ Leverage: {leverage}x
 📝 Type: {order_type}"""
@@ -258,6 +282,7 @@ All orders cancelled. Positions closed."""
             "take_profit": "✅ Take Profit Hit",
             "stop_loss": "❌ Stop Loss Hit",
             "trailing_stop": "📈 Trailing Stop Hit",
+            "chandelier_exit": "📈 Chandelier Exit",
             "manual": "🖐️ Manual Close",
             "emergency": "🚨 Emergency Close",
         }

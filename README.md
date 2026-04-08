@@ -1,21 +1,20 @@
 # 🤖 Hyperliquid Algorithmic Trading Bot
 
-A Python-based algorithmic trading bot for the [Hyperliquid](https://hyperliquid.xyz) decentralized perpetuals exchange. The bot implements a multi-timeframe trend-following strategy with strict risk management.
+A Python-based algorithmic trading bot for the [Hyperliquid](https://hyperliquid.xyz) decentralized perpetuals exchange. The bot implements a multi-timeframe trend-following strategy with **ATR-based volatility targeting** and **Chandelier Exit** risk management.
 
 ## 📋 Features
 
 - **Multi-Timeframe Analysis**: Daily trend (SMA/EMA) + Intraday signals (VWAP/RSI)
-- **Automated Trading**: Fully automated entry with bracket orders (SL/TP)
-- **Risk Management**: Isolated margin, configurable position sizing, dynamic SL/TP
+- **Automated Trading**: Fully automated entry with dynamic position sizing
+- **ATR Volatility Targeting**: Position size calculated from risk % and ATR-based SL distance
+- **Chandelier Exit**: Dynamic trailing stop that follows price using ATR multiplier
 - **Kill Switch**: Emergency shutdown via Ctrl+C (cancels all orders, closes positions)
 - **Live Dashboard**: Real-time terminal display of market data and positions
 
 ### Advanced Features
 
 - **Limit Orders for Entry**: Earn maker rebates by placing limit orders at best bid/ask
-- **Trailing Stop Loss**: SL dynamically trails price using ATR multiplier
 - **Macro Filters**: Block trades based on funding rate or low volatility conditions
-- **ATR-Based Risk**: Dynamic SL/TP calculated from market volatility
 - **State Recovery**: Automatically recovers position tracking after bot restarts
 - **Telegram Alerts**: Real-time notifications for trades and bot status
 - **Interactive Telegram Bot**: Remote control via Telegram commands
@@ -27,7 +26,7 @@ The bot includes an interactive Telegram interface for remote monitoring and con
 | Command | Description |
 |---------|-------------|
 | `/status` | Account balance, positions, and unrealized PnL |
-| `/config` | Current configuration summary (strategy, risk) |
+| `/config` | Current configuration (strategy, ATR parameters, risk) |
 | `/pause` | Pause new trade entries (keeps managing existing positions) |
 | `/resume` | Resume trading |
 | `/panic` | ⚠️ Emergency: Close all positions immediately |
@@ -48,6 +47,11 @@ The bot follows a trend-continuation strategy:
 1. **Daily Trend**: Price above/below SMA determines direction (only LONG when bullish, only SHORT when bearish)
 2. **VWAP Confirmation**: Price must cross VWAP in the trend direction
 3. **RSI Timing**: RSI must be exiting extreme zone (< 30 for longs, > 70 for shorts)
+
+**Exit Logic (Chandelier Exit):**
+- No fixed Take Profit - positions trail with ATR-based stop
+- LONG: `SL = max(prev_SL, highest_high - ATR × trail_multiplier)`
+- SHORT: `SL = min(prev_SL, lowest_low + ATR × trail_multiplier)`
 
 ## 🚀 Quick Start
 
@@ -93,8 +97,8 @@ TELEGRAM_CHAT_ID=your_chat_id_here
 {
   "trading": {
     "symbols": ["BTC", "ETH"],
-    "leverage": 5,
-    "position_size_percent": 5.0
+    "margin_type": "isolated",
+    "max_leverage": 10
   },
   "strategy": {
     "daily_ma_type": "SMA",
@@ -105,8 +109,12 @@ TELEGRAM_CHAT_ID=your_chat_id_here
     "rsi_overbought": 70
   },
   "risk_management": {
-    "stop_loss_percent": 2.0,
-    "take_profit_percent": 4.0
+    "risk_percent_per_trade": 2.0,
+    "atr_period": 14,
+    "atr_sl_multiplier": 1.5,
+    "atr_trailing_multiplier": 2.0,
+    "use_limit_orders": false,
+    "limit_order_timeout": 60
   },
   "notifications": {
     "enable_telegram_alerts": false
@@ -134,8 +142,8 @@ To receive trade alerts on your phone:
 
 **Notification types:**
 - 🤖 Bot startup/shutdown
-- 🟢/🔴 Trade opened (LONG/SHORT)
-- 💰 Trade closed with PnL
+- 🟢/🔴 Trade opened (LONG/SHORT) with ATR-based SL
+- 💰 Trade closed via Chandelier Exit with PnL
 - 📈 Trailing stop updates
 - ⚠️ Error alerts
 
@@ -155,7 +163,7 @@ Press **`Ctrl+C`** at any time to trigger an emergency shutdown:
 
 ## 🔬 Parameter Optimization (Backtesting)
 
-The `backtest/` folder contains a grid search optimizer to find the best parameters:
+The `backtest/` folder contains a grid search optimizer to find the best ATR parameters:
 
 ```bash
 uv run python backtest/run_optimization.py
@@ -163,12 +171,10 @@ uv run python backtest/run_optimization.py
 
 This will:
 1. Fetch last 30 days of BTC 15m candles from Hyperliquid
-2. Test 8,100+ parameter combinations (MA, RSI, SL/TP, etc.)
+2. Test ATR multiplier combinations (SL: 1.0-2.5, Trail: 1.5-3.0)
 3. Print a detailed performance report
-4. Save optimal config to `config_optimized.json`
-
-**Quick mode** (faster, fewer combinations):
-Edit `backtest/run_optimization.py` and set `QUICK_MODE = True`
+4. **Directly update `config.json`** with optimal parameters
+5. Send Telegram notification with results (if configured)
 
 **Metrics available:**
 - `total_pnl` - Total profit/loss (default)
@@ -186,12 +192,9 @@ bot_hyperliquide/
 ├── pyproject.toml          # Project dependencies
 │
 ├── main.py                 # Entry point (run this)
-├── config.json             # Trading parameters
-├── config_optimized.json   # Generated by optimizer
-├── pyproject.toml          # Project dependencies
 │
 ├── backtest/               # Parameter optimization
-│   ├── backtester.py       # Backtesting engine
+│   ├── backtester.py       # ATR volatility targeting simulation
 │   ├── optimizer.py        # Grid search optimizer
 │   └── run_optimization.py # Run optimization script
 │
@@ -207,17 +210,56 @@ bot_hyperliquide/
 │   │   └── signals.py      # Entry signal logic
 │   │
 │   ├── risk/
-│   │   └── manager.py      # Position sizing, SL/TP, order execution
+│   │   └── manager.py      # ATR volatility targeting, Chandelier Exit
 │   │
 │   └── utils/
-│       └── logger.py       # Terminal logging
+│       ├── logger.py       # Terminal logging
+│       ├── notifier.py     # Telegram notifications
+│       └── telegram_bot.py # Interactive Telegram commands
 │
 └── tests/                  # Test scripts
-    ├── test_client.py
-    ├── test_indicators.py
-    ├── test_risk_manager.py
-    └── test_signals.py
 ```
+
+## ⚙️ Configuration Options
+
+### Trading Settings
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `symbols` | Trading pairs | `["BTC", "ETH"]` |
+| `max_leverage` | Maximum allowed leverage | `10` |
+| `margin_type` | Margin mode | `isolated` |
+
+### Strategy Settings
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `daily_ma_type` | Moving average type | `SMA` |
+| `daily_ma_period` | MA period | `50` |
+| `intraday_timeframe` | Candle timeframe | `15m` |
+| `rsi_period` | RSI calculation period | `14` |
+| `rsi_oversold` | Oversold threshold | `30` |
+| `rsi_overbought` | Overbought threshold | `70` |
+
+### Risk Management (ATR Dynamic)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `risk_percent_per_trade` | % of account to risk per trade | `2.0` |
+| `atr_period` | ATR calculation period | `14` |
+| `atr_sl_multiplier` | ATR multiplier for initial SL | `1.5` |
+| `atr_trailing_multiplier` | ATR multiplier for Chandelier Exit | `2.0` |
+| `use_limit_orders` | Use limit orders for entry | `false` |
+| `limit_order_timeout` | Seconds to wait for limit fill | `60` |
+
+### Macro Filters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `funding_filter_enabled` | Block trades when funding is extreme | `false` |
+| `funding_threshold` | Funding rate threshold (%) | `0.01` |
+| `volatility_filter_enabled` | Block trades in low volatility | `false` |
+| `volatility_threshold` | ATR ratio threshold | `0.5` |
 
 ## 🧪 Running Tests
 
@@ -233,77 +275,7 @@ uv run python tests/test_risk_manager.py
 
 # Test signal generation (no API required)
 uv run python tests/test_signals.py
-
-# Test advanced features: limit orders, trailing stop, macro filters
-uv run python tests/test_advanced_features.py
 ```
-
-## 🔬 Advanced Parameter Optimization
-
-The backtester now supports advanced features. To optimize with trailing stop and volatility filter:
-
-```python
-from backtest.optimizer import ParameterOptimizer, print_optimization_report
-
-optimizer = ParameterOptimizer()
-result = optimizer.optimize_advanced(df, metric="total_pnl")
-print_optimization_report(result)
-```
-
-This tests additional parameters:
-- `trailing_stop_enabled` (True/False)
-- `trailing_atr_multiplier` (1.0, 1.5, 2.0)
-- `volatility_filter_enabled` (True/False)
-- `volatility_threshold` (0.3, 0.5, 0.7)
-
-## ⚙️ Configuration Options
-
-### Trading Settings
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `symbols` | Trading pairs | `["BTC", "ETH"]` |
-| `leverage` | Leverage multiplier | `5` |
-| `margin_type` | Margin mode | `isolated` |
-| `position_size_percent` | % of account per trade | `5.0` |
-
-### Strategy Settings
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `daily_ma_type` | Moving average type | `SMA` |
-| `daily_ma_period` | MA period | `50` |
-| `intraday_timeframe` | Candle timeframe | `15m` |
-| `rsi_period` | RSI calculation period | `14` |
-| `rsi_oversold` | Oversold threshold | `30` |
-| `rsi_overbought` | Overbought threshold | `70` |
-
-### Risk Management
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `stop_loss_percent` | Fixed SL % from entry | `2.0` |
-| `take_profit_percent` | Fixed TP % from entry | `4.0` |
-| `use_atr_for_sl` | Use ATR for dynamic SL | `false` |
-| `atr_multiplier` | ATR multiplier for SL | `1.5` |
-
-### Advanced Execution (NEW)
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `use_limit_orders` | Use limit orders for entry (earn rebates) | `false` |
-| `limit_order_timeout` | Seconds to wait for limit fill | `60` |
-| `trailing_stop_enabled` | Enable trailing stop loss | `false` |
-| `trailing_atr_multiplier` | ATR multiplier for trailing distance | `1.5` |
-
-### Macro Filters (NEW)
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `funding_filter_enabled` | Block trades when funding is extreme | `false` |
-| `funding_threshold` | Funding rate threshold (%) | `0.01` |
-| `volatility_filter_enabled` | Block trades in low volatility | `false` |
-| `volatility_threshold` | ATR ratio threshold | `0.5` |
 
 ## 🔧 Extending the Bot
 

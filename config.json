@@ -3,34 +3,30 @@
     "symbols": [
       "BTC"
     ],
-    "leverage": 5,
     "margin_type": "isolated",
-    "position_size_percent": 5.0
+    "max_leverage": 10
   },
   "strategy": {
-    "daily_ma_type": "SMA",
-    "daily_ma_period": 50,
+    "daily_ma_type": "EMA",
+    "daily_ma_period": 100,
     "intraday_timeframe": "15m",
-    "rsi_period": 7,
-    "rsi_oversold": 35,
+    "rsi_period": 14,
+    "rsi_oversold": 25,
     "rsi_overbought": 65,
     "vwap_enabled": false
   },
   "risk_management": {
-    "stop_loss_percent": 1.0,
-    "take_profit_percent": 5.0,
-    "use_atr_for_sl": false,
+    "risk_percent_per_trade": 2.0,
     "atr_period": 14,
-    "atr_multiplier": 1.5,
+    "atr_sl_multiplier": 1.0,
+    "atr_trailing_multiplier": 2.0,
     "use_limit_orders": true,
-    "limit_order_timeout": 60,
-    "trailing_stop_enabled": true,
-    "trailing_atr_multiplier": 1.5
+    "limit_order_timeout": 60
   },
   "filters": {
     "funding_filter_enabled": true,
     "funding_threshold": 0.01,
-    "volatility_filter_enabled": true,
+    "volatility_filter_enabled": false,
     "volatility_atr_period": 14,
     "volatility_lookback": 20,
     "volatility_threshold": 0.5
