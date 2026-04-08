@@ -400,6 +400,7 @@ class TelegramBotController:
                 self._application.run_polling(
                     allowed_updates=["message"],
                     drop_pending_updates=True,
+                    stop_signals=None,
                 )
             )
             
