@@ -97,6 +97,9 @@ class HyperliquidClient:
         self.exchange = Exchange(
             wallet=self.wallet,
             base_url=self.base_url,
+            # Ensure trading actions (market_close/order/cancel) target the same account
+            # used for state queries (self.wallet_address), even if signer differs.
+            account_address=self.wallet_address,
         )
 
     def get_account_balance(self) -> AccountBalance:
@@ -180,6 +183,26 @@ class HyperliquidClient:
             raw_usd=perp_raw_usd,
             spot_usdc=spot_usdc,
         )
+
+    def normalize_size(self, symbol: str, size: float) -> float:
+        """Normalize order size to asset size precision expected by Hyperliquid."""
+        numeric_size = float(size)
+        asset = self.info.coin_to_asset.get(symbol)
+        if asset is None:
+            return float(f"{numeric_size:.8f}")
+        sz_decimals = self.info.asset_to_sz_decimals.get(asset, 6)
+        return round(numeric_size, sz_decimals)
+
+    def normalize_price(self, symbol: str, price: float) -> float:
+        """Normalize order/trigger price to Hyperliquid wire precision."""
+        numeric_price = float(price)
+        asset = self.info.coin_to_asset.get(symbol)
+        if asset is None:
+            return float(f"{numeric_price:.6f}")
+        sz_decimals = self.info.asset_to_sz_decimals.get(asset, 0)
+        price_decimals = max(0, 6 - sz_decimals)
+        # Match SDK approach: 5 significant digits, then clamp to allowed decimals.
+        return round(float(f"{numeric_price:.5g}"), price_decimals)
 
     def get_open_positions(self) -> list[Position]:
         """Fetch all open positions.
@@ -373,12 +396,20 @@ class HyperliquidClient:
             List of open order dicts.
         """
         try:
-            orders = self.info.open_orders(self.wallet_address)
+            # frontend_open_orders includes trigger metadata (isTrigger, triggerPx, orderType).
+            orders = self.info.frontend_open_orders(self.wallet_address)
             if symbol:
                 return [o for o in orders if o.get("coin") == symbol]
             return orders
         except Exception:
-            return []
+            # Fallback for older SDK behavior.
+            try:
+                orders = self.info.open_orders(self.wallet_address)
+                if symbol:
+                    return [o for o in orders if o.get("coin") == symbol]
+                return orders
+            except Exception:
+                return []
 
     def cancel_order(self, symbol: str, order_id: int) -> dict:
         """Cancel a specific order.
@@ -479,14 +510,15 @@ class HyperliquidClient:
             List of trigger order dicts with order details.
         """
         try:
-            # Hyperliquid API returns trigger orders separately
-            orders = self.info.open_orders(self.wallet_address)
+            # Use frontend_open_orders to reliably detect trigger orders.
+            orders = self.info.frontend_open_orders(self.wallet_address)
             
             # Filter to only trigger orders
             trigger_orders = []
             for order in orders:
-                order_type = order.get("orderType", "")
-                if "trigger" in str(order_type).lower() or order.get("triggerCondition"):
+                is_trigger = bool(order.get("isTrigger"))
+                order_type = str(order.get("orderType", ""))
+                if is_trigger or "trigger" in order_type.lower() or order.get("triggerCondition"):
                     if symbol is None or order.get("coin") == symbol:
                         trigger_orders.append(order)
             

@@ -1,25 +1,25 @@
-Last Optuna optimization: 2026-04-08T17:48:44.680056
+Last Optuna optimization: 2026-04-13T20:47:27.805954
 Symbol: BTC
 Days analyzed: 30
 Trials: 1000
-Best Score: 369.6761
+Best Score: 265.0910
 Config Updated: True
 
 Best Strategy Params:
   ma_type: SMA
   ma_period: 60
-  rsi_period: 7
+  rsi_period: 8
   rsi_oversold: 21
-  rsi_overbought: 68
-  use_vwap: False
+  rsi_overbought: 69
+  use_vwap: True
 
 Best Risk Params:
-  atr_period: 19
-  atr_sl_multiplier: 1.3
-  atr_trailing_multiplier: 3.7
+  atr_period: 15
+  atr_sl_multiplier: 2.4
+  atr_trailing_multiplier: 3.9
 
 Performance:
-  Win Rate: 45.8%
-  Total PnL: $4,875.60
-  Max Drawdown: 12.2%
-  Sharpe Ratio: 0.50
+  Win Rate: 54.5%
+  Total PnL: $1,677.78
+  Max Drawdown: 5.3%
+  Sharpe Ratio: 0.41

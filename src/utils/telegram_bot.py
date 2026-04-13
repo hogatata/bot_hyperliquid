@@ -28,6 +28,8 @@ class BotState:
     risk_manager: object = None  # RiskManager
     settings: object = None  # Settings
     notifier: object = None  # TelegramNotifier
+    last_algo_update: str = "N/A"
+    last_market_state: dict = None  # Per-symbol snapshot from main loop
 
 
 # Global state shared with main loop
@@ -59,6 +61,8 @@ async def cmd_status(update, context) -> None:
         # Get account info
         balance = client.get_account_balance()
         positions = client.get_open_positions()
+        risk_manager = bot_state.risk_manager
+        market_state = bot_state.last_market_state or {}
         
         # Build message
         pause_status = "⏸️ PAUSED" if bot_state.is_paused else "▶️ RUNNING"
@@ -78,17 +82,47 @@ async def cmd_status(update, context) -> None:
             for pos in positions:
                 pnl_emoji = "🟢" if pos.unrealized_pnl >= 0 else "🔴"
                 side_emoji = "📈" if pos.side == "long" else "📉"
+                pnl_percent = (pos.unrealized_pnl / balance.account_value * 100) if balance.account_value > 0 else 0.0
+
+                sl_text = "N/A"
+                if risk_manager is not None:
+                    if pos.symbol in risk_manager.active_positions:
+                        sl_text = f"${risk_manager.active_positions[pos.symbol].current_sl:,.2f}"
+                    else:
+                        sl_check = risk_manager.has_existing_sl_order(pos.symbol)
+                        if sl_check.get("has_sl") and sl_check.get("sl_price") is not None:
+                            sl_text = f"${float(sl_check['sl_price']):,.2f}"
+                if sl_text == "N/A":
+                    sl_text = "N/A"
+
                 msg += (
                     f"\n{side_emoji} <b>{pos.symbol}</b> ({pos.side.upper()})\n"
                     f"  • Entry: ${pos.entry_price:,.2f}\n"
                     f"  • Size: {pos.size}\n"
-                    f"  • PnL: {pnl_emoji} ${pos.unrealized_pnl:+,.2f}\n"
+                    f"  • PnL: {pnl_emoji} ${pos.unrealized_pnl:+,.2f} ({pnl_percent:+.2f}%)\n"
+                    f"  • Stop Loss: {sl_text}\n"
                 )
                 total_pnl += pos.unrealized_pnl
             
             msg += f"\n<b>Total Unrealized PnL: ${total_pnl:+,.2f}</b>\n"
         else:
             msg += "<i>No open positions</i>\n"
+
+        msg += (
+            "\n<b>🕒 Last Algorithm Update:</b>\n"
+            f"  • Time: {bot_state.last_algo_update}\n"
+        )
+
+        if market_state:
+            msg += "\n<b>🌍 Market State (Last Cycle):</b>\n"
+            for symbol, snap in market_state.items():
+                msg += (
+                    f"\n<b>{symbol}</b>\n"
+                    f"  • Price: ${snap.get('price', 0):,.2f}\n"
+                    f"  • Trend: {str(snap.get('trend', 'N/A')).upper()}\n"
+                    f"  • RSI: {snap.get('rsi', 'N/A')}\n"
+                    f"  • Signal: {snap.get('signal_reason', 'N/A')}\n"
+                )
         
         await update.message.reply_text(msg, parse_mode="HTML")
         
@@ -235,19 +269,33 @@ async def cmd_panic(update, context) -> None:
         
         cancelled = results.get("cancelled_orders", [])
         closed = results.get("closed_positions", [])
+        remaining = results.get("remaining_positions", [])
+        panic_success = results.get("panic_success", len(remaining) == 0)
         
         # Set bot to paused
         bot_state.is_paused = True
         
         # Build response
-        msg = (
-            "<b>🚨 PANIC SHUTDOWN COMPLETE</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"• Cancelled {len(cancelled)} orders\n"
-            f"• Closed {len(closed)} positions\n\n"
-            "<b>⏸️ Bot is now PAUSED</b>\n"
-            "Use /resume to restart trading."
-        )
+        if panic_success:
+            msg = (
+                "<b>🚨 PANIC SHUTDOWN COMPLETE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"• Cancelled {len(cancelled)} orders\n"
+                f"• Close attempts: {len(closed)}\n"
+                "• Remaining positions: 0\n\n"
+                "<b>⏸️ Bot is now PAUSED</b>\n"
+                "Use /resume to restart trading."
+            )
+        else:
+            msg = (
+                "<b>⚠️ PANIC PARTIAL FAILURE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"• Cancelled {len(cancelled)} orders\n"
+                f"• Close attempts: {len(closed)}\n"
+                f"• Remaining positions: {len(remaining)}\n\n"
+                "<b>⏸️ Bot is now PAUSED</b>\n"
+                "Check exchange/account mapping and logs before /resume."
+            )
         
         # Add details
         if closed:
@@ -255,6 +303,10 @@ async def cmd_panic(update, context) -> None:
             for result in closed:
                 status = "✓" if result.success else "✗"
                 msg += f"  {status} {result.message}\n"
+        if remaining:
+            msg += "\n<b>Still Open on Hyperliquid:</b>\n"
+            for pos in remaining:
+                msg += f"  • {pos.side.upper()} {pos.size} {pos.symbol}\n"
         
         await update.message.reply_text(msg, parse_mode="HTML")
         
@@ -265,7 +317,8 @@ async def cmd_panic(update, context) -> None:
             bot_state.notifier._send_message(
                 "🚨 <b>PANIC SHUTDOWN</b>\n\n"
                 f"Cancelled {len(cancelled)} orders\n"
-                f"Closed {len(closed)} positions\n"
+                f"Close attempts: {len(closed)}\n"
+                f"Remaining positions: {len(remaining)}\n"
                 "Bot is now PAUSED"
             )
         
@@ -343,6 +396,8 @@ class TelegramBotController:
         risk_manager=None,
         settings=None,
         notifier=None,
+        last_algo_update=None,
+        last_market_state=None,
     ):
         """Update the shared state (call after initialization)."""
         if client is not None:
@@ -353,6 +408,10 @@ class TelegramBotController:
             bot_state.settings = settings
         if notifier is not None:
             bot_state.notifier = notifier
+        if last_algo_update is not None:
+            bot_state.last_algo_update = last_algo_update
+        if last_market_state is not None:
+            bot_state.last_market_state = last_market_state
     
     @property
     def is_paused(self) -> bool:

@@ -350,6 +350,7 @@ def run_bot():
         loop_count += 1
 
         try:
+            latest_market_state = {}
             for symbol in settings.trading.symbols:
                 # Fetch candle data
                 # We need enough candles for indicators (MA period + buffer)
@@ -396,6 +397,21 @@ def run_bot():
                 current_atr = df[atr_column].iloc[-1] if not df.empty else None
                 
                 if current_position:
+                    if symbol not in risk_manager.active_positions:
+                        adopt_result = risk_manager.adopt_external_position(
+                            symbol=symbol,
+                            side_str=current_position.side,
+                            entry_price=current_position.entry_price,
+                            size=current_position.size,
+                            current_high=df["high"].iloc[-1],
+                            current_low=df["low"].iloc[-1],
+                            current_atr=current_atr,
+                        )
+                        if adopt_result.success:
+                            logger.warning(f"🔄 Adopted external {current_position.side.upper()} position on {symbol}: {adopt_result.message}")
+                        else:
+                            logger.critical(f"🚨 Failed to adopt external position on {symbol}: {adopt_result.message}")
+
                     # Get current candle high/low for Chandelier calculation
                     current_high = df["high"].iloc[-1]
                     current_low = df["low"].iloc[-1]
@@ -408,6 +424,18 @@ def run_bot():
                     )
                     if trail_result and trail_result.success:
                         logger.info(f"📈 {trail_result.message}")
+                    elif trail_result and not trail_result.success:
+                        logger.error(f"✗ Trailing SL update failed for {symbol}: {trail_result.message}")
+                        emergency_result = risk_manager.emergency_close_symbol(
+                            symbol=symbol,
+                            reason=f"Trailing SL update failure: {trail_result.message}",
+                        )
+                        if emergency_result.success:
+                            logger.warning(f"🚨 Emergency close executed for {symbol} after SL update failure")
+                        else:
+                            logger.critical(
+                                f"🚨 CRITICAL: emergency close failed for {symbol} after SL update failure: {emergency_result.message}"
+                            )
                     
                     # Get current trailing SL for display
                     if symbol in risk_manager.active_positions:
@@ -452,6 +480,13 @@ def run_bot():
                     )
                 else:
                     position_info = "No open position"
+
+                latest_market_state[symbol] = {
+                    "price": result.current_price,
+                    "trend": result.trend,
+                    "rsi": round(result.rsi_value, 2) if result.rsi_value is not None else "N/A",
+                    "signal_reason": result.reason + (" ⏸️ PAUSED" if telegram_bot.is_paused else ""),
+                }
                 
                 # Add pause indicator if paused
                 pause_indicator = " ⏸️ PAUSED" if telegram_bot.is_paused else ""
@@ -474,6 +509,10 @@ def run_bot():
                     funding_rate=funding_rate,
                     trailing_sl=trailing_sl_price,
                     features=active_features,
+                )
+                telegram_bot.update_state(
+                    last_algo_update=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    last_market_state=latest_market_state,
                 )
 
                 # Execute trade if signal and no position (and not paused)

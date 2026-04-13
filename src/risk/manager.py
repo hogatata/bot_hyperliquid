@@ -1,5 +1,6 @@
 """Risk manager for ATR-based volatility targeting and Chandelier Exit."""
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -8,6 +9,8 @@ from typing import Optional
 import pandas as pd
 
 from src.exchange import HyperliquidClient
+
+logger = logging.getLogger(__name__)
 
 
 class Side(Enum):
@@ -28,6 +31,8 @@ class TradeSetup:
     stop_loss: float
     calculated_leverage: int  # Dynamic based on position size
     risk_amount: float  # USD amount at risk (fixed % of account)
+    account_value: float  # Account value at setup time
+    risk_percent: float  # Configured risk percent per trade
     atr_value: float  # Current ATR for trailing stop
     sl_distance: float  # ATR * sl_multiplier
 
@@ -236,21 +241,22 @@ class RiskManager:
                 highest_price = entry_price  # Not relevant for short trailing
                 lowest_price = df_since_entry["low"].min()
 
-            # Get existing SL/TP orders for this symbol
-            existing_orders = self.client.get_open_orders(symbol)
+            # Get existing trigger orders (SL/TP) for this symbol
+            existing_orders = self.client.get_trigger_orders(symbol)
             sl_order_id = None
             tp_order_id = None
             current_sl = None
 
             for order in existing_orders:
-                order_type = order.get("orderType", {})
-                if isinstance(order_type, dict):
-                    trigger_info = order_type.get("trigger", {})
-                    if trigger_info.get("tpsl") == "sl":
-                        sl_order_id = order.get("oid")
-                        current_sl = float(trigger_info.get("triggerPx", 0))
-                    elif trigger_info.get("tpsl") == "tp":
-                        tp_order_id = order.get("oid")
+                order_type = str(order.get("orderType", "")).lower()
+                trigger_condition = str(order.get("triggerCondition", "")).lower()
+                if "sl" in order_type or "stop" in order_type or "stop" in trigger_condition:
+                    sl_order_id = order.get("oid")
+                    trigger_px = order.get("triggerPx")
+                    if trigger_px is not None:
+                        current_sl = float(trigger_px)
+                elif "tp" in order_type or "take" in trigger_condition:
+                    tp_order_id = order.get("oid")
 
             # Calculate initial SL using ATR
             sl_distance = current_atr * self.atr_sl_multiplier if current_atr > 0 else entry_price * 0.02
@@ -260,6 +266,47 @@ class RiskManager:
                     current_sl = entry_price - sl_distance
                 else:
                     current_sl = entry_price + sl_distance
+                # Critical safety: recreate missing SL on startup recovery.
+                try:
+                    is_buy_close = side == Side.SHORT
+                    safe_current_sl = self.client.normalize_price(symbol, current_sl)
+                    safe_size = self.client.normalize_size(symbol, position.size)
+                    recreated = self.client.exchange.order(
+                        name=symbol,
+                        is_buy=is_buy_close,
+                        sz=safe_size,
+                        limit_px=safe_current_sl,
+                        order_type={
+                            "trigger": {
+                                "triggerPx": safe_current_sl,
+                                "isMarket": True,
+                                "tpsl": "sl",
+                            }
+                        },
+                        reduce_only=True,
+                    )
+                    recreated_oid = self._extract_order_id(recreated)
+                    if recreated.get("status") == "ok" and recreated_oid is not None:
+                        current_sl = safe_current_sl
+                        sl_order_id = recreated_oid
+                        logger.warning(
+                            "Recovered position had no SL. Recreated SL | symbol=%s sl=%.4f oid=%s",
+                            symbol,
+                            current_sl,
+                            sl_order_id,
+                        )
+                    else:
+                        logger.critical(
+                            "Recovered position still unprotected: failed to recreate SL | symbol=%s response=%s",
+                            symbol,
+                            recreated,
+                        )
+                except Exception as e:
+                    logger.critical(
+                        "Recovered position still unprotected: exception recreating SL | symbol=%s error=%s",
+                        symbol,
+                        e,
+                    )
 
             # Create ActivePosition
             active_pos = ActivePosition(
@@ -345,18 +392,19 @@ class RiskManager:
             return {"synced": False, "message": "No active position to sync"}
 
         pos = self.active_positions[symbol]
-        existing_orders = self.client.get_open_orders(symbol)
+        existing_orders = self.client.get_trigger_orders(symbol)
 
         synced_sl = False
 
         for order in existing_orders:
-            order_type = order.get("orderType", {})
-            if isinstance(order_type, dict):
-                trigger_info = order_type.get("trigger", {})
-                if trigger_info.get("tpsl") == "sl":
-                    pos.sl_order_id = order.get("oid")
-                    pos.current_sl = float(trigger_info.get("triggerPx", pos.current_sl))
-                    synced_sl = True
+            order_type = str(order.get("orderType", "")).lower()
+            trigger_condition = str(order.get("triggerCondition", "")).lower()
+            if "sl" in order_type or "stop" in order_type or "stop" in trigger_condition:
+                pos.sl_order_id = order.get("oid")
+                trigger_px = order.get("triggerPx")
+                if trigger_px is not None:
+                    pos.current_sl = float(trigger_px)
+                synced_sl = True
 
         return {
             "synced": True,
@@ -382,15 +430,16 @@ class RiskManager:
         }
 
         try:
-            orders = self.client.get_open_orders(symbol)
+            orders = self.client.get_trigger_orders(symbol)
             for order in orders:
-                order_type = order.get("orderType", {})
-                if isinstance(order_type, dict):
-                    trigger_info = order_type.get("trigger", {})
-                    if trigger_info.get("tpsl") == "sl":
-                        result["has_sl"] = True
-                        result["sl_price"] = float(trigger_info.get("triggerPx", 0))
-                        result["sl_order_id"] = order.get("oid")
+                order_type = str(order.get("orderType", "")).lower()
+                trigger_condition = str(order.get("triggerCondition", "")).lower()
+                if "sl" in order_type or "stop" in order_type or "stop" in trigger_condition:
+                    result["has_sl"] = True
+                    trigger_px = order.get("triggerPx")
+                    if trigger_px is not None:
+                        result["sl_price"] = float(trigger_px)
+                    result["sl_order_id"] = order.get("oid")
         except Exception:
             pass
 
@@ -519,6 +568,8 @@ class RiskManager:
             stop_loss=round(stop_loss, 2),
             calculated_leverage=leverage,
             risk_amount=round(risk_amount, 2),
+            account_value=round(account_value, 2),
+            risk_percent=self.risk_percent_per_trade,
             atr_value=atr_value,
             sl_distance=sl_distance,
         )
@@ -545,6 +596,24 @@ class RiskManager:
         """
         results = {}
         is_buy = setup.side == Side.LONG
+        estimated_risk_usd = abs(setup.entry_price - setup.stop_loss) * setup.size
+        logger.info(
+            (
+                "Pre-trade risk snapshot | symbol=%s side=%s atr=%.8f entry=%.4f "
+                "stop=%.4f size=%.6f estimated_risk_usd=%.2f target_risk_usd=%.2f "
+                "account_value=%.2f risk_percent=%.2f"
+            ),
+            setup.symbol,
+            setup.side.value.upper(),
+            setup.atr_value,
+            setup.entry_price,
+            setup.stop_loss,
+            setup.size,
+            estimated_risk_usd,
+            setup.risk_amount,
+            setup.account_value,
+            setup.risk_percent,
+        )
 
         # Step 1: Set leverage (isolated margin)
         if dry_run:
@@ -596,14 +665,61 @@ class RiskManager:
 
         # Step 3: Place Stop Loss order (trigger order, reduce_only)
         sl_order_id = None
+        sl_size = self._get_live_position_size(setup.symbol) if not dry_run else setup.size
+        if sl_size is None or sl_size <= 0:
+            sl_size = setup.size
+        if abs(sl_size - setup.size) > 1e-9:
+            logger.warning(
+                "SL size adjusted from setup size using live position | symbol=%s setup_size=%.6f live_size=%.6f",
+                setup.symbol,
+                setup.size,
+                sl_size,
+            )
+        # Recalculate SL from ACTUAL entry price to preserve configured max risk after slippage.
+        sl_distance = abs(setup.entry_price - setup.stop_loss)
+        if setup.side == Side.LONG:
+            effective_stop_loss = actual_entry_price - sl_distance
+        else:
+            effective_stop_loss = actual_entry_price + sl_distance
+        effective_stop_loss = round(effective_stop_loss, 2)
+        sl_estimated_risk_usd = abs(actual_entry_price - effective_stop_loss) * sl_size
+        logger.info(
+            (
+                "Preparing stop order | symbol=%s side=%s atr=%.8f entry=%.4f stop=%.4f "
+                "size=%.6f estimated_risk_usd=%.2f"
+            ),
+            setup.symbol,
+            setup.side.value.upper(),
+            setup.atr_value,
+            actual_entry_price,
+            effective_stop_loss,
+            sl_size,
+            sl_estimated_risk_usd,
+        )
         if dry_run:
             results["stop_loss"] = OrderResult(
                 success=True,
-                message=f"[DRY RUN] Would place SL @ ${setup.stop_loss:,.2f}",
+                message=f"[DRY RUN] Would place SL @ ${effective_stop_loss:,.2f}",
             )
         else:
-            results["stop_loss"] = self._place_stop_loss(setup, is_buy)
+            results["stop_loss"] = self._place_stop_loss(
+                setup,
+                is_buy,
+                order_size=sl_size,
+                stop_loss_price=effective_stop_loss,
+            )
             sl_order_id = results["stop_loss"].order_id
+            if not results["stop_loss"].success:
+                logger.critical(
+                    "Stop-loss placement failed after entry. Triggering emergency close | symbol=%s reason=%s",
+                    setup.symbol,
+                    results["stop_loss"].message,
+                )
+                results["emergency_close"] = self._emergency_close_position(
+                    symbol=setup.symbol,
+                    reason=results["stop_loss"].message,
+                )
+                return results
 
         # Step 4: Register for Chandelier Exit trailing stop management
         if not dry_run and results["entry"].success:
@@ -611,8 +727,8 @@ class RiskManager:
                 symbol=setup.symbol,
                 side=setup.side,
                 entry_price=actual_entry_price,
-                size=setup.size,
-                current_sl=setup.stop_loss,
+                size=sl_size,
+                current_sl=effective_stop_loss,
                 atr_value=setup.atr_value,
                 atr_trailing_multiplier=self.atr_trailing_multiplier,
                 highest_price=actual_entry_price,
@@ -625,10 +741,11 @@ class RiskManager:
     def _execute_market_entry(self, setup: TradeSetup, is_buy: bool) -> OrderResult:
         """Execute market entry order."""
         try:
+            safe_size = self.client.normalize_size(setup.symbol, setup.size)
             response = self.client.exchange.market_open(
                 name=setup.symbol,
                 is_buy=is_buy,
-                sz=setup.size,
+                sz=safe_size,
             )
             order_id = self._extract_order_id(response)
             return OrderResult(
@@ -659,12 +776,14 @@ class RiskManager:
 
             # Place limit at best bid (long) or best ask (short) for maker rebate
             limit_price = best_bid if is_buy else best_ask
+            safe_limit_price = self.client.normalize_price(setup.symbol, limit_price)
+            safe_size = self.client.normalize_size(setup.symbol, setup.size)
 
             response = self.client.exchange.order(
                 name=setup.symbol,
                 is_buy=is_buy,
-                sz=setup.size,
-                limit_px=limit_price,
+                sz=safe_size,
+                limit_px=safe_limit_price,
                 order_type={"limit": {"tif": "Gtc"}},  # Good-til-cancelled
                 reduce_only=False,
             )
@@ -684,7 +803,7 @@ class RiskManager:
                 return OrderResult(
                     success=True,
                     order_id=order_id,
-                    message=f"LIMIT {setup.side.value.upper()} {setup.size} {setup.symbol} @ ${limit_price:,.2f} (filled)",
+                    message=f"LIMIT {setup.side.value.upper()} {setup.size} {setup.symbol} @ ${safe_limit_price:,.2f} (filled)",
                     details=response,
                 )
 
@@ -702,7 +821,7 @@ class RiskManager:
                     return OrderResult(
                         success=True,
                         order_id=order_id,
-                        message=f"LIMIT {setup.side.value.upper()} {setup.size} {setup.symbol} @ ${limit_price:,.2f} (filled)",
+                        message=f"LIMIT {setup.side.value.upper()} {setup.size} {setup.symbol} @ ${safe_limit_price:,.2f} (filled)",
                         details=response,
                     )
 
@@ -726,29 +845,71 @@ class RiskManager:
                 message=f"Failed to place limit entry: {e}",
             )
 
-    def _place_stop_loss(self, setup: TradeSetup, is_buy: bool) -> OrderResult:
+    def _place_stop_loss(
+        self,
+        setup: TradeSetup,
+        is_buy: bool,
+        order_size: float,
+        stop_loss_price: float,
+    ) -> OrderResult:
         """Place stop loss trigger order."""
         try:
+            safe_trigger_px = self.client.normalize_price(setup.symbol, stop_loss_price)
+            safe_order_size = self.client.normalize_size(setup.symbol, order_size)
             sl_order_type = {
                 "trigger": {
-                    "triggerPx": setup.stop_loss,
+                    "triggerPx": safe_trigger_px,
                     "isMarket": True,
                     "tpsl": "sl",
                 }
             }
+            logger.info(
+                (
+                    "Submitting Hyperliquid trigger SL order | symbol=%s is_buy=%s "
+                    "reduce_only=true size=%.6f limit_px=%.4f order_type=%s"
+                ),
+                setup.symbol,
+                not is_buy,
+                safe_order_size,
+                safe_trigger_px,
+                sl_order_type,
+            )
             response = self.client.exchange.order(
                 name=setup.symbol,
                 is_buy=not is_buy,  # Opposite direction to close
-                sz=setup.size,
-                limit_px=setup.stop_loss,
+                sz=safe_order_size,
+                limit_px=safe_trigger_px,
                 order_type=sl_order_type,
                 reduce_only=True,
             )
             order_id = self._extract_order_id(response)
+            success = response.get("status") == "ok" and order_id is not None
+            if success:
+                # Explicit exchange-side verification: confirm trigger order is actually visible.
+                time.sleep(0.25)
+                verified = self._verify_trigger_order_visible(
+                    symbol=setup.symbol,
+                    order_id=order_id,
+                    expected_trigger_px=safe_trigger_px,
+                )
+                if not verified:
+                    return OrderResult(
+                        success=False,
+                        order_id=order_id,
+                        message=(
+                            "SL order accepted but not visible in open trigger orders. "
+                            "Treating as failure for safety."
+                        ),
+                        details=response,
+                    )
             return OrderResult(
-                success=response.get("status") == "ok",
+                success=success,
                 order_id=order_id,
-                message=f"SL placed @ ${setup.stop_loss:,.2f}",
+                message=(
+                    f"SL placed @ ${stop_loss_price:,.2f}"
+                    if success
+                    else f"SL rejected/invalid response: {response}"
+                ),
                 details=response,
             )
         except Exception as e:
@@ -757,12 +918,79 @@ class RiskManager:
                 message=f"Failed to place SL: {e}",
             )
 
+    def _verify_trigger_order_visible(
+        self,
+        symbol: str,
+        order_id: int,
+        expected_trigger_px: float,
+        tolerance: float = 0.5,
+    ) -> bool:
+        """Verify the newly created SL is present in frontend trigger orders."""
+        try:
+            trigger_orders = self.client.get_trigger_orders(symbol)
+            for order in trigger_orders:
+                if order.get("oid") != order_id:
+                    continue
+                trigger_px_raw = order.get("triggerPx")
+                if trigger_px_raw is None:
+                    return True
+                trigger_px = float(trigger_px_raw)
+                return abs(trigger_px - expected_trigger_px) <= tolerance
+            logger.error(
+                "SL not found in trigger orders after placement | symbol=%s oid=%s expected_trigger_px=%.4f",
+                symbol,
+                order_id,
+                expected_trigger_px,
+            )
+            return False
+        except Exception as e:
+            logger.error("Failed to verify trigger order visibility for %s: %s", symbol, e)
+            return False
+
+    def _get_live_position_size(self, symbol: str) -> float | None:
+        """Get the current absolute open size for a symbol."""
+        try:
+            positions = self.client.get_open_positions()
+            for position in positions:
+                if position.symbol == symbol:
+                    return abs(position.size)
+        except Exception as e:
+            logger.warning("Could not fetch live position size for %s: %s", symbol, e)
+        return None
+
+    def _emergency_close_position(self, symbol: str, reason: str) -> OrderResult:
+        """Immediately close a position if SL creation failed."""
+        try:
+            logger.critical(
+                "EMERGENCY CLOSE | symbol=%s reason=%s",
+                symbol,
+                reason,
+            )
+            response = self.client.exchange.market_close(coin=symbol)
+            success = bool(response) and response.get("status") == "ok"
+            return OrderResult(
+                success=success,
+                message=(
+                    f"Emergency close executed for {symbol}"
+                    if success
+                    else f"Emergency close failed for {symbol}: {response}"
+                ),
+                details=response,
+            )
+        except Exception as e:
+            return OrderResult(
+                success=False,
+                message=f"Emergency close exception for {symbol}: {e}",
+            )
+
     def _place_take_profit(self, setup: TradeSetup, is_buy: bool) -> OrderResult:
         """Place take profit trigger order."""
         try:
+            safe_tp_price = self.client.normalize_price(setup.symbol, setup.take_profit)
+            safe_size = self.client.normalize_size(setup.symbol, setup.size)
             tp_order_type = {
                 "trigger": {
-                    "triggerPx": setup.take_profit,
+                    "triggerPx": safe_tp_price,
                     "isMarket": True,
                     "tpsl": "tp",
                 }
@@ -770,8 +998,8 @@ class RiskManager:
             response = self.client.exchange.order(
                 name=setup.symbol,
                 is_buy=not is_buy,  # Opposite direction to close
-                sz=setup.size,
-                limit_px=setup.take_profit,
+                sz=safe_size,
+                limit_px=safe_tp_price,
                 order_type=tp_order_type,
                 reduce_only=True,
             )
@@ -865,35 +1093,147 @@ class RiskManager:
 
         return None
 
-    def _update_sl_order(self, pos: ActivePosition, new_sl: float) -> OrderResult:
-        """Cancel old SL and place new one at updated price."""
-        old_sl = pos.current_sl
-        try:
-            # Cancel existing SL order
-            if pos.sl_order_id:
-                self.client.cancel_order(pos.symbol, pos.sl_order_id)
+    def adopt_external_position(
+        self,
+        symbol: str,
+        side_str: str,
+        entry_price: float,
+        size: float,
+        current_high: float,
+        current_low: float,
+        current_atr: float | None = None,
+    ) -> OrderResult:
+        """Adopt an externally opened position and ensure it has a protective SL."""
+        side = Side.LONG if side_str.lower() == "long" else Side.SHORT
+        atr_value = current_atr if current_atr is not None and current_atr > 0 else entry_price * 0.02
 
-            # Place new SL
-            is_buy = pos.side == Side.SHORT  # Opposite direction to close
+        # Detect existing SL first.
+        sl_check = self.has_existing_sl_order(symbol)
+        if sl_check.get("has_sl") and sl_check.get("sl_price") is not None:
+            sl_price = float(sl_check["sl_price"])
+            sl_order_id = sl_check.get("sl_order_id")
+        else:
+            sl_price = self.calculate_atr_stop_loss(entry_price, side, atr_value)
+            is_buy_close = side == Side.SHORT
+            safe_sl_price = self.client.normalize_price(symbol, sl_price)
+            safe_size = self.client.normalize_size(symbol, size)
             sl_order_type = {
                 "trigger": {
-                    "triggerPx": new_sl,
+                    "triggerPx": safe_sl_price,
                     "isMarket": True,
                     "tpsl": "sl",
                 }
             }
             response = self.client.exchange.order(
+                name=symbol,
+                is_buy=is_buy_close,
+                sz=safe_size,
+                limit_px=safe_sl_price,
+                order_type=sl_order_type,
+                reduce_only=True,
+            )
+            sl_order_id = self._extract_order_id(response)
+            if response.get("status") != "ok" or sl_order_id is None:
+                return OrderResult(
+                    success=False,
+                    message=f"Failed to place SL while adopting external position: {response}",
+                    details=response,
+                )
+            verified = self._verify_trigger_order_visible(
+                symbol=symbol,
+                order_id=sl_order_id,
+                expected_trigger_px=safe_sl_price,
+            )
+            if not verified:
+                return OrderResult(
+                    success=False,
+                    order_id=sl_order_id,
+                    message="External position adopted, but SL is not visible in trigger orders",
+                    details=response,
+                )
+            sl_price = safe_sl_price
+
+        if side == Side.LONG:
+            highest_price = max(entry_price, current_high)
+            lowest_price = entry_price
+        else:
+            highest_price = entry_price
+            lowest_price = min(entry_price, current_low)
+
+        self.active_positions[symbol] = ActivePosition(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            size=size,
+            current_sl=sl_price,
+            atr_value=atr_value,
+            atr_trailing_multiplier=self.atr_trailing_multiplier,
+            highest_price=highest_price,
+            lowest_price=lowest_price,
+            sl_order_id=sl_order_id,
+        )
+
+        return OrderResult(
+            success=True,
+            order_id=sl_order_id,
+            message=f"External position adopted and protected with SL @ ${sl_price:,.2f}",
+        )
+
+    def _update_sl_order(self, pos: ActivePosition, new_sl: float) -> OrderResult:
+        """Cancel current SL and recreate a fresh trigger SL at new price."""
+        old_sl = pos.current_sl
+        try:
+            is_buy = pos.side == Side.SHORT  # Opposite direction to close
+            safe_new_sl = self.client.normalize_price(pos.symbol, new_sl)
+            safe_size = self.client.normalize_size(pos.symbol, pos.size)
+            sl_order_type = {
+                "trigger": {
+                    "triggerPx": safe_new_sl,
+                    "isMarket": True,
+                    "tpsl": "sl",
+                }
+            }
+
+            if pos.sl_order_id:
+                cancel_response = self.client.cancel_order(pos.symbol, pos.sl_order_id)
+                if cancel_response.get("status") != "ok":
+                    return OrderResult(
+                        success=False,
+                        order_id=pos.sl_order_id,
+                        message=f"Failed to cancel previous Chandelier SL: {cancel_response}",
+                        details=cancel_response,
+                    )
+
+            response = self.client.exchange.order(
                 name=pos.symbol,
                 is_buy=is_buy,
-                sz=pos.size,
-                limit_px=new_sl,
+                sz=safe_size,
+                limit_px=safe_new_sl,
                 order_type=sl_order_type,
                 reduce_only=True,
             )
 
             if response.get("status") == "ok":
-                pos.current_sl = new_sl
-                pos.sl_order_id = self._extract_order_id(response)
+                new_order_id = self._extract_order_id(response)
+                if new_order_id is None:
+                    return OrderResult(
+                        success=False,
+                        message=f"Failed to update Chandelier Exit SL: invalid response {response}",
+                    )
+                verified = self._verify_trigger_order_visible(
+                    symbol=pos.symbol,
+                    order_id=new_order_id,
+                    expected_trigger_px=safe_new_sl,
+                )
+                if not verified:
+                    return OrderResult(
+                        success=False,
+                        order_id=new_order_id,
+                        message="Trailing SL recreated but not visible in trigger orders",
+                        details=response,
+                    )
+                pos.current_sl = safe_new_sl
+                pos.sl_order_id = new_order_id
                 return OrderResult(
                     success=True,
                     order_id=pos.sl_order_id,
@@ -910,6 +1250,10 @@ class RiskManager:
                 success=False,
                 message=f"Error updating Chandelier Exit SL: {e}",
             )
+
+    def emergency_close_symbol(self, symbol: str, reason: str) -> OrderResult:
+        """Public emergency close helper for callers that need symbol-level fail-safe."""
+        return self._emergency_close_position(symbol=symbol, reason=reason)
 
     def clear_position_tracking(self, symbol: str):
         """Remove position from tracking (called when position closes)."""
@@ -984,16 +1328,11 @@ class RiskManager:
                     continue
 
                 try:
-                    response = self.client.exchange.market_close(
-                        coin=pos.symbol,
+                    close_result = self._close_position_with_verification(
+                        symbol=pos.symbol,
+                        size=pos.size,
                     )
-                    results.append(
-                        OrderResult(
-                            success=response.get("status") == "ok" if response else False,
-                            message=f"Closed {pos.side.upper()} {pos.size} {pos.symbol}",
-                            details=response,
-                        )
-                    )
+                    results.append(close_result)
                 except Exception as e:
                     results.append(
                         OrderResult(
@@ -1011,6 +1350,46 @@ class RiskManager:
 
         return results
 
+    def _close_position_with_verification(self, symbol: str, size: float, max_attempts: int = 3) -> OrderResult:
+        """Close a position and verify it is actually gone on exchange."""
+        last_response = None
+        for attempt in range(1, max_attempts + 1):
+            response = self.client.exchange.market_close(
+                coin=symbol,
+                sz=size,
+            )
+            last_response = response
+
+            if not response or response.get("status") != "ok":
+                logger.error("Market close failed | symbol=%s attempt=%d response=%s", symbol, attempt, response)
+                continue
+
+            # Hyperliquid state can lag briefly after close.
+            time.sleep(0.4)
+            if not self._is_position_still_open(symbol):
+                return OrderResult(
+                    success=True,
+                    message=f"Closed position {symbol} (verified)",
+                    details=response,
+                )
+
+            logger.warning("Position still open after close attempt | symbol=%s attempt=%d", symbol, attempt)
+
+        return OrderResult(
+            success=False,
+            message=f"Failed to fully close {symbol} after {max_attempts} attempts",
+            details=last_response,
+        )
+
+    def _is_position_still_open(self, symbol: str) -> bool:
+        """Check if a position remains open for a symbol."""
+        try:
+            open_positions = self.client.get_open_positions()
+            return any(pos.symbol == symbol for pos in open_positions)
+        except Exception as e:
+            logger.error("Failed to verify position status for %s: %s", symbol, e)
+            return True
+
     def emergency_shutdown(self) -> dict:
         """Execute emergency shutdown (kill switch).
 
@@ -1021,10 +1400,15 @@ class RiskManager:
         Returns:
             Dict with results for cancellations and closures.
         """
-        # Clear all position tracking
+        cancelled_orders = self.cancel_all_orders()
+        close_attempts = self.close_all_positions()
+        # Force verification: panic should fail loudly if positions remain open.
+        remaining_positions = self.client.get_open_positions()
         self.active_positions.clear()
 
         return {
-            "cancelled_orders": self.cancel_all_orders(),
-            "closed_positions": self.close_all_positions(),
+            "cancelled_orders": cancelled_orders,
+            "closed_positions": close_attempts,
+            "remaining_positions": remaining_positions,
+            "panic_success": len(remaining_positions) == 0,
         }
