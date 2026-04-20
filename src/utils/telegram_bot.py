@@ -143,10 +143,15 @@ async def cmd_config(update, context) -> None:
         return
     
     try:
-        settings = bot_state.settings
-        if settings is None:
+        if bot_state.settings is None:
             await update.message.reply_text("❌ Bot not fully initialized yet.")
             return
+        # Always reload from disk to reflect optimizer updates
+        from src.config.settings import load_settings
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = bot_state.settings
         
         # Build config summary
         msg = (
